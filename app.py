@@ -1,19 +1,20 @@
-import os
-from dash import Dash, dcc, html, callback, Input, Output, no_update
-import dash_bootstrap_components as dbc
-import plotly.express as px
-import pandas as pd
-import numpy as np
-import requests
-import urllib.parse
 import json
+import os
+import threading
 import time
-from functools import lru_cache
+import urllib.parse
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from dash import Dash, Input, Output, callback, dcc, html, no_update
+import dash_bootstrap_components as dbc
+import numpy as np
+import pandas as pd
+import plotly.express as px
 from pythermalcomfort.models import utci
+import requests
 
 # ==============================================================================
-# DATA INGESTION & PROCESSING
+# DATA INGESTION & GEOMETRY PRE-PROCESSING
 # ==============================================================================
 with open("India-Districts-2011Census.json") as f:
     district_geojson = json.load(f)
@@ -70,44 +71,60 @@ for feature in district_geojson["features"]:
         "lat": lat,
         "lon": lon,
     })
-df = pd.DataFrame(records)
+
+# In-memory global data container and thread safety lock
+df_base = pd.DataFrame(records)
+df = df_base.copy()
+df_lock = threading.Lock()
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 BATCH_SIZE = 50
 
-@lru_cache(maxsize=256)
-def fetch_batch_cached(lats_tuple, lons_tuple):
-    params = {
-        "latitude": ",".join(lats_tuple),
-        "longitude": ",".join(lons_tuple),
-        "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,surface_pressure,cloud_cover,precipitation,wind_speed_10m",
-        "forecast_days": 4,
-        "wind_speed_unit": "ms"
-    }
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            res = requests.get(OPEN_METEO_URL, params=params, timeout=30)
-            if res.status_code == 429:
-                time.sleep((attempt + 1) * 3)
-                continue
-            res.raise_for_status()
-            data = res.json()
-            return (data,) if isinstance(data, dict) else tuple(data)
-        except Exception as e:
-            if attempt == max_retries - 1: raise e
-            time.sleep(1)
-    raise RuntimeError("Batch fetch failed after retries.")
+# ==============================================================================
+# WEATHER FETCH & PROCESSING PIPELINE
+# ==============================================================================
+def utci_stress_category(value):
+    if pd.isna(value): return "No data"
+    if value > 46: return "Extreme heat stress"
+    if value > 38: return "Very strong heat stress"
+    if value > 32: return "Strong heat stress"
+    if value > 26: return "Moderate heat stress"
+    if value > 9: return "No thermal stress"
+    if value > 0: return "Slight cold stress"
+    if value > -13: return "Moderate cold stress"
+    if value > -27: return "Strong cold stress"
+    return "Extreme cold stress"
+
+def calculate_f_utci(val):
+    if pd.isna(val) or val <= 26: return 0.05
+    if val <= 32: return 0.05 + 0.02 * (val - 26)
+    if val <= 38: return 0.17 + 0.04 * (val - 32)
+    if val <= 46: return 0.41 + 0.06 * (val - 38)
+    return 0.89 + 0.08 * (val - 46)
+
+DEMO_WEIGHTS = {"Elderly (60+ yrs)": 1.8, "Adults (18-59 yrs)": 1.0, "Children (0-5 yrs)": 1.3}
 
 def fetch_multi_day_weather(dataframe):
     lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
     all_responses = []
+    
     for i in range(0, len(dataframe), BATCH_SIZE):
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
+        params = {
+            "latitude": ",".join(f"{x:.4f}" for x in b_lats),
+            "longitude": ",".join(f"{x:.4f}" for x in b_lons),
+            "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,surface_pressure,cloud_cover,precipitation,wind_speed_10m",
+            "forecast_days": 4,
+            "wind_speed_unit": "ms"
+        }
         try:
-            batch_res = fetch_batch_cached(tuple(f"{x:.4f}" for x in b_lats), tuple(f"{x:.4f}" for x in b_lons))
-            all_responses.extend(batch_res)
+            res = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                all_responses.extend(data if isinstance(data, list) else [data])
+            else:
+                all_responses.extend([None] * len(b_lats))
         except Exception:
             all_responses.extend([None] * len(b_lats))
         time.sleep(0.05)
@@ -118,13 +135,13 @@ def fetch_multi_day_weather(dataframe):
         for item in all_responses:
             if item and "hourly" in item:
                 h = item["hourly"]
-                temps.append(h["temperature_2m"][h_idx] if len(h["temperature_2m"]) > h_idx else None)
-                rh.append(h["relative_humidity_2m"][h_idx] if len(h["relative_humidity_2m"]) > h_idx else None)
-                wind.append(h["wind_speed_10m"][h_idx] if len(h["wind_speed_10m"]) > h_idx else None)
-                apparent.append(h["apparent_temperature"][h_idx] if len(h["apparent_temperature"]) > h_idx else None)
-                pressure.append(h["surface_pressure"][h_idx] if len(h["surface_pressure"]) > h_idx else None)
-                cloud.append(h["cloud_cover"][h_idx] if len(h["cloud_cover"]) > h_idx else None)
-                precip.append(h["precipitation"][h_idx] if len(h["precipitation"]) > h_idx else None)
+                temps.append(h["temperature_2m"][h_idx] if len(h.get("temperature_2m", [])) > h_idx else None)
+                rh.append(h["relative_humidity_2m"][h_idx] if len(h.get("relative_humidity_2m", [])) > h_idx else None)
+                wind.append(h["wind_speed_10m"][h_idx] if len(h.get("wind_speed_10m", [])) > h_idx else None)
+                apparent.append(h["apparent_temperature"][h_idx] if len(h.get("apparent_temperature", [])) > h_idx else None)
+                pressure.append(h["surface_pressure"][h_idx] if len(h.get("surface_pressure", [])) > h_idx else None)
+                cloud.append(h["cloud_cover"][h_idx] if len(h.get("cloud_cover", [])) > h_idx else None)
+                precip.append(h["precipitation"][h_idx] if len(h.get("precipitation", [])) > h_idx else None)
             else:
                 temps.append(None); rh.append(None); wind.append(None)
                 apparent.append(None); pressure.append(None); cloud.append(None); precip.append(None)
@@ -160,37 +177,31 @@ def fetch_multi_day_weather(dataframe):
         vals = u_res.utci if hasattr(u_res, "utci") else u_res
         dataframe[f"UTCI_d{d_idx}"] = [round(v, 1) if not pd.isna(v) else np.nan for v in vals]
 
+        dataframe[f"Stress Category_d{d_idx}"] = dataframe[f"UTCI_d{d_idx}"].apply(utci_stress_category)
+        f_vals = dataframe[f"UTCI_d{d_idx}"].apply(calculate_f_utci)
+        for demo, weight in DEMO_WEIGHTS.items():
+            dataframe[f"Mortality_{demo}_d{d_idx}"] = (f_vals * weight * 50).round(1).clip(upper=100.0)
+
     return dataframe
 
-df = fetch_multi_day_weather(df)
+def refresh_weather_job():
+    """Background task to fetch and overwrite in-memory dataset atomically."""
+    global df
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Executing scheduled 6-hour weather fetch...")
+    updated_df = fetch_multi_day_weather(df_base.copy())
+    with df_lock:
+        df = updated_df
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] In-memory weather dataset updated.")
 
-def utci_stress_category(value):
-    if pd.isna(value): return "No data"
-    if value > 46: return "Extreme heat stress"
-    if value > 38: return "Very strong heat stress"
-    if value > 32: return "Strong heat stress"
-    if value > 26: return "Moderate heat stress"
-    if value > 9: return "No thermal stress"
-    if value > 0: return "Slight cold stress"
-    if value > -13: return "Moderate cold stress"
-    if value > -27: return "Strong cold stress"
-    return "Extreme cold stress"
+# Cold-start fetch upon server initialization
+refresh_weather_job()
 
-def calculate_f_utci(val):
-    if pd.isna(val) or val <= 26: return 0.05
-    if val <= 32: return 0.05 + 0.02 * (val - 26)
-    if val <= 38: return 0.17 + 0.04 * (val - 32)
-    if val <= 46: return 0.41 + 0.06 * (val - 38)
-    return 0.89 + 0.08 * (val - 46)
+# Configure BackgroundScheduler for 6-hour interval updates
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(refresh_weather_job, trigger="interval", hours=6)
+scheduler.start()
 
-DEMO_WEIGHTS = {"Elderly (60+ yrs)": 1.8, "Adults (18-59 yrs)": 1.0, "Children (0-5 yrs)": 1.3}
-
-for d in range(4):
-    df[f"Stress Category_d{d}"] = df[f"UTCI_d{d}"].apply(utci_stress_category)
-    f_vals = df[f"UTCI_d{d}"].apply(calculate_f_utci)
-    for demo, weight in DEMO_WEIGHTS.items():
-        df[f"Mortality_{demo}_d{d}"] = (f_vals * weight * 50).round(1).clip(upper=100.0)
-
+# UI Constants
 MEASUREMENTS = {
     "UTCI (deg C)": "UTCI",
     "Dry Bulb Temp (deg C)": "Dry Bulb Temp",
@@ -198,10 +209,15 @@ MEASUREMENTS = {
     "Wind Speed (m/s)": "Wind Speed",
     "Relative Humidity (%)": "Relative Humidity",
 }
-DEFAULT_SLIDER_BOUNDS = {"UTCI (deg C)": [15, 45], "Dry Bulb Temp (deg C)": [10, 45], "Mean Radiant Temp (deg C)": [10, 45], "Wind Speed (m/s)": [0, 10], "Relative Humidity (%)": [0, 100]}
+DEFAULT_SLIDER_BOUNDS = {
+    "UTCI (deg C)": [15, 45],
+    "Dry Bulb Temp (deg C)": [10, 45],
+    "Mean Radiant Temp (deg C)": [10, 45],
+    "Wind Speed (m/s)": [0, 10],
+    "Relative Humidity (%)": [0, 100]
+}
 states_list = sorted(df["State"].unique().tolist())
 district_options = [{"label": f"{r['District']}, {r['State']}", "value": r["join_key"]} for _, r in df.iterrows()]
-
 
 # ==============================================================================
 # DASH APPLICATION & LAYOUT
@@ -257,7 +273,7 @@ app.index_string = '''
             }
             .light-mode .rc-slider-mark-text,
             .light-mode .rc-slider-mark-text-active {
-                color: #0f172a !important; /* High contrast Slate-900 */
+                color: #0f172a !important;
                 font-weight: 700 !important;
             }
             .light-mode .rc-slider-dot {
@@ -346,7 +362,7 @@ app.index_string = '''
             }
             .dark-mode .rc-slider-mark-text,
             .dark-mode .rc-slider-mark-text-active {
-                color: #f8fafc !important; /* High contrast Slate-50 */
+                color: #f8fafc !important;
                 font-weight: 700 !important;
             }
             .dark-mode .rc-slider-dot {
@@ -561,24 +577,27 @@ def update_app_theme(dark_mode):
     Input('theme-switch', 'value')
 )
 def update_kpis(horizon, dark_mode):
+    with df_lock:
+        local_df = df.copy()
+
     utci_col = f"UTCI_d{horizon}"
     temp_col = f"Dry Bulb Temp_d{horizon}"
     
-    valid = df.dropna(subset=[temp_col])
-    avg_u = round(df[utci_col].mean(), 1) if not df[utci_col].empty else "N/A"
+    valid = local_df.dropna(subset=[temp_col])
+    avg_u = round(local_df[utci_col].mean(), 1) if not local_df[utci_col].empty else "N/A"
     max_r = valid.loc[valid[temp_col].idxmax()] if not valid.empty else None
     min_r = valid.loc[valid[temp_col].idxmin()] if not valid.empty else None
 
     if dark_mode:
-        avg_color = "#60a5fa"   # Bright Light Blue
-        hot_color = "#f87171"   # Soft Red
-        cool_color = "#38bdf8"  # Bright Cyan
-        dist_color = "#f8fafc"  # White/Light Slate
+        avg_color = "#60a5fa"
+        hot_color = "#f87171"
+        cool_color = "#38bdf8"
+        dist_color = "#f8fafc"
     else:
-        avg_color = "#1d4ed8"   # High-contrast Deep Blue
-        hot_color = "#b91c1c"   # High-contrast Deep Red
-        cool_color = "#0369a1"   # High-contrast Deep Sky Blue
-        dist_color = "#0f172a"   # Dark Slate
+        avg_color = "#1d4ed8"
+        hot_color = "#b91c1c"
+        cool_color = "#0369a1"
+        dist_color = "#0f172a"
 
     return dbc.Row([
         dbc.Col([
@@ -597,7 +616,7 @@ def update_kpis(horizon, dark_mode):
         ]),
         dbc.Col([
             html.Div("Monitored Districts", className="text-muted small fw-bold text-uppercase"),
-            html.Div(f"{len(df)}", className="fs-3 fw-bolder", style={"color": dist_color})
+            html.Div(f"{len(local_df)}", className="fs-3 fw-bolder", style={"color": dist_color})
         ])
     ])
 
@@ -607,9 +626,12 @@ def update_kpis(horizon, dark_mode):
     Input('measurements', 'value'), Input('forecast-horizon', 'value')
 )
 def update_slider_limits(measurement_chosen, horizon):
+    with df_lock:
+        local_df = df.copy()
+
     col_prefix = MEASUREMENTS[measurement_chosen]
     target_col = f"{col_prefix}_d{horizon}"
-    min_val, max_val = float(df[target_col].min()), float(df[target_col].max())
+    min_val, max_val = float(local_df[target_col].min()), float(local_df[target_col].max())
     p_min, p_max = float(np.floor(min_val)), float(np.ceil(max_val))
     if p_min == p_max: p_max += 1.0
     ticks = np.linspace(p_min, p_max, 5)
@@ -624,8 +646,11 @@ def update_slider_limits(measurement_chosen, horizon):
     Input('theme-switch', 'value')
 )
 def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode):
+    with df_lock:
+        local_df = df.copy()
+
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
+    filtered_df = local_df if selected_state == "ALL" else local_df[local_df['State'] == selected_state]
     r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
 
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
@@ -647,8 +672,11 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     Input('theme-switch', 'value')
 )
 def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode):
+    with df_lock:
+        local_df = df.copy()
+
     target_col = f"Mortality_{demo_class}_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
+    filtered_df = local_df if selected_state == "ALL" else local_df[local_df['State'] == selected_state]
 
     if mortality_range:
         filtered_df = filtered_df[
@@ -685,7 +713,10 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     if not searched_district:
         return html.Div("👆 Select or click any district on the map to inspect micro-climate metrics.", className="text-center text-muted p-4 mt-2 fw-bold")
 
-    row = df[df['join_key'] == searched_district]
+    with df_lock:
+        local_df = df.copy()
+
+    row = local_df[local_df['join_key'] == searched_district]
     if row.empty: return no_update
     r = row.iloc[0]
 
@@ -754,8 +785,11 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     Input('theme-switch', 'value')
 )
 def update_stress_chart(selected_state, horizon, dark_mode):
+    with df_lock:
+        local_df = df.copy()
+
     target_col = f"Stress Category_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
+    filtered_df = local_df if selected_state == "ALL" else local_df[local_df['State'] == selected_state]
     counts = filtered_df[target_col].value_counts().reset_index()
     counts.columns = ['Category', 'Count']
     
