@@ -14,7 +14,7 @@ from pythermalcomfort.models import utci
 # ==============================================================================
 # DATA INGESTION & PROCESSING
 # ==============================================================================
-with open("SIHProject/India-Districts-2011Census.json") as f:
+with open("India-Districts-2011Census.json") as f:
     district_geojson = json.load(f)
 
 for feature in district_geojson["features"]:
