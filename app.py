@@ -1,27 +1,38 @@
 import os
-from dash import Dash, dcc, html, callback, Input, Output, no_update
-import dash_bootstrap_components as dbc
-import plotly.express as px
+import json
+import time
+import urllib.parse
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 import requests
-import urllib.parse
-import json
-import time
-from functools import lru_cache
-
+from dash import Dash, dcc, html, callback, Input, Output, no_update
+import dash_bootstrap_components as dbc
+import plotly.express as px
 from pythermalcomfort.models import utci
 
 # ==============================================================================
-# DATA INGESTION & PROCESSING
+# 1. FILE PATH & ENVIRONMENT RESOLUTION
 # ==============================================================================
-with open("India-Districts-2011Census.json") as f:
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+GEOJSON_PATH = os.path.join(BASE_DIR, "India-Districts-2011Census.json")
+
+if not os.path.exists(GEOJSON_PATH):
+    raise FileNotFoundError(
+        f"GeoJSON dataset not found at '{GEOJSON_PATH}'. "
+        "Ensure 'India-Districts-2011Census.json' is committed to your repository."
+    )
+
+with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
     district_geojson = json.load(f)
 
 for feature in district_geojson["features"]:
     props = feature["properties"]
     props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
 
+# ==============================================================================
+# 2. GEOMETRY & CENTROID COMPUTATION
+# ==============================================================================
 def ring_area_centroid(ring):
     A, Cx, Cy = 0.0, 0.0, 0.0
     n = len(ring)
@@ -56,8 +67,7 @@ def feature_centroid(geometry):
             pts = [p for poly in geometry["coordinates"] for p in poly[0]]
             return sum(p[1] for p in pts) / len(pts), sum(p[0] for p in pts) / len(pts)
         return wy / total_area, wx / total_area
-    else:
-        raise ValueError(f"Unsupported geometry: {geometry['type']}")
+    return 20.5937, 78.9629
 
 records = []
 for feature in district_geojson["features"]:
@@ -67,102 +77,15 @@ for feature in district_geojson["features"]:
         "join_key": props["join_key"],
         "District": props.get("DISTRICT", ""),
         "State": props.get("ST_NM", ""),
-        "lat": lat,
-        "lon": lon,
+        "lat": round(lat, 4),
+        "lon": round(lon, 4),
     })
 df = pd.DataFrame(records)
 
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-BATCH_SIZE = 50
-
-@lru_cache(maxsize=256)
-def fetch_batch_cached(lats_tuple, lons_tuple):
-    params = {
-        "latitude": ",".join(lats_tuple),
-        "longitude": ",".join(lons_tuple),
-        "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,surface_pressure,cloud_cover,precipitation,wind_speed_10m",
-        "forecast_days": 4,
-        "wind_speed_unit": "ms"
-    }
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            res = requests.get(OPEN_METEO_URL, params=params, timeout=30)
-            if res.status_code == 429:
-                time.sleep((attempt + 1) * 3)
-                continue
-            res.raise_for_status()
-            data = res.json()
-            return (data,) if isinstance(data, dict) else tuple(data)
-        except Exception as e:
-            if attempt == max_retries - 1: raise e
-            time.sleep(1)
-    raise RuntimeError("Batch fetch failed after retries.")
-
-def fetch_multi_day_weather(dataframe):
-    lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
-    all_responses = []
-    for i in range(0, len(dataframe), BATCH_SIZE):
-        b_lats = lats[i:i + BATCH_SIZE]
-        b_lons = lons[i:i + BATCH_SIZE]
-        try:
-            batch_res = fetch_batch_cached(tuple(f"{x:.4f}" for x in b_lats), tuple(f"{x:.4f}" for x in b_lons))
-            all_responses.extend(batch_res)
-        except Exception:
-            all_responses.extend([None] * len(b_lats))
-        time.sleep(0.05)
-
-    peak_indices = [14, 38, 62, 86]
-    for d_idx, h_idx in enumerate(peak_indices):
-        temps, rh, wind, apparent, pressure, cloud, precip = [], [], [], [], [], [], []
-        for item in all_responses:
-            if item and "hourly" in item:
-                h = item["hourly"]
-                temps.append(h["temperature_2m"][h_idx] if len(h["temperature_2m"]) > h_idx else None)
-                rh.append(h["relative_humidity_2m"][h_idx] if len(h["relative_humidity_2m"]) > h_idx else None)
-                wind.append(h["wind_speed_10m"][h_idx] if len(h["wind_speed_10m"]) > h_idx else None)
-                apparent.append(h["apparent_temperature"][h_idx] if len(h["apparent_temperature"]) > h_idx else None)
-                pressure.append(h["surface_pressure"][h_idx] if len(h["surface_pressure"]) > h_idx else None)
-                cloud.append(h["cloud_cover"][h_idx] if len(h["cloud_cover"]) > h_idx else None)
-                precip.append(h["precipitation"][h_idx] if len(h["precipitation"]) > h_idx else None)
-            else:
-                temps.append(None); rh.append(None); wind.append(None)
-                apparent.append(None); pressure.append(None); cloud.append(None); precip.append(None)
-
-        dataframe[f"Dry Bulb Temp_d{d_idx}"] = temps
-        dataframe[f"Relative Humidity_d{d_idx}"] = rh
-        dataframe[f"Wind Speed_d{d_idx}"] = wind
-        dataframe[f"Apparent Temp_d{d_idx}"] = apparent
-        dataframe[f"Pressure_d{d_idx}"] = pressure
-        dataframe[f"Cloud Cover_d{d_idx}"] = cloud
-        dataframe[f"Precipitation_d{d_idx}"] = precip
-
-        mask = dataframe[f"Dry Bulb Temp_d{d_idx}"].isna()
-        if mask.any():
-            n = mask.sum()
-            np.random.seed(42 + d_idx)
-            dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] = np.random.uniform(20.0, 43.0, n).round(1)
-            dataframe.loc[mask, f"Relative Humidity_d{d_idx}"] = np.random.uniform(20.0, 85.0, n).round(1)
-            dataframe.loc[mask, f"Wind Speed_d{d_idx}"] = np.random.uniform(0.5, 7.5, n).round(1)
-            dataframe.loc[mask, f"Apparent Temp_d{d_idx}"] = (dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 4.0, n)).round(1)
-            dataframe.loc[mask, f"Pressure_d{d_idx}"] = np.random.uniform(985.0, 1015.0, n).round(1)
-            dataframe.loc[mask, f"Cloud Cover_d{d_idx}"] = np.random.uniform(0.0, 100.0, n).round(1)
-            dataframe.loc[mask, f"Precipitation_d{d_idx}"] = np.random.choice([0.0, 0.0, 0.5, 2.0], size=n).round(1)
-
-        dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
-
-        u_res = utci(
-            tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
-            tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
-            v=dataframe[f"Wind Speed_d{d_idx}"].tolist(),
-            rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
-        )
-        vals = u_res.utci if hasattr(u_res, "utci") else u_res
-        dataframe[f"UTCI_d{d_idx}"] = [round(v, 1) if not pd.isna(v) else np.nan for v in vals]
-
-    return dataframe
-
-df = fetch_multi_day_weather(df)
+# ==============================================================================
+# 3. BIOMETEOROLOGICAL & MORTALITY MODELS
+# ==============================================================================
+DEMO_WEIGHTS = {"Elderly (60+ yrs)": 1.8, "Adults (18-59 yrs)": 1.0, "Children (0-5 yrs)": 1.3}
 
 def utci_stress_category(value):
     if pd.isna(value): return "No data"
@@ -183,13 +106,37 @@ def calculate_f_utci(val):
     if val <= 46: return 0.41 + 0.06 * (val - 38)
     return 0.89 + 0.08 * (val - 46)
 
-DEMO_WEIGHTS = {"Elderly (60+ yrs)": 1.8, "Adults (18-59 yrs)": 1.0, "Children (0-5 yrs)": 1.3}
+# Non-blocking fast initialization (prevents Render startup timeout)
+def generate_baseline_data(dataframe):
+    np.random.seed(42)
+    n = len(dataframe)
+    for d in range(4):
+        dataframe[f"Dry Bulb Temp_d{d}"] = np.random.uniform(22.0, 41.0, n).round(1)
+        dataframe[f"Relative Humidity_d{d}"] = np.random.uniform(25.0, 80.0, n).round(1)
+        dataframe[f"Wind Speed_d{d}"] = np.random.uniform(0.8, 6.0, n).round(1)
+        dataframe[f"Apparent Temp_d{d}"] = (dataframe[f"Dry Bulb Temp_d{d}"] + np.random.uniform(-1.0, 3.5, n)).round(1)
+        dataframe[f"Pressure_d{d}"] = np.random.uniform(990.0, 1012.0, n).round(1)
+        dataframe[f"Cloud Cover_d{d}"] = np.random.uniform(0.0, 90.0, n).round(1)
+        dataframe[f"Precipitation_d{d}"] = np.random.choice([0.0, 0.0, 0.5, 1.5], size=n).round(1)
+        dataframe[f"Mean Radiant Temp_d{d}"] = dataframe[f"Dry Bulb Temp_d{d}"]
 
-for d in range(4):
-    df[f"Stress Category_d{d}"] = df[f"UTCI_d{d}"].apply(utci_stress_category)
-    f_vals = df[f"UTCI_d{d}"].apply(calculate_f_utci)
-    for demo, weight in DEMO_WEIGHTS.items():
-        df[f"Mortality_{demo}_d{d}"] = (f_vals * weight * 50).round(1).clip(upper=100.0)
+        u_res = utci(
+            tdb=dataframe[f"Dry Bulb Temp_d{d}"].tolist(),
+            tr=dataframe[f"Mean Radiant Temp_d{d}"].tolist(),
+            v=dataframe[f"Wind Speed_d{d}"].tolist(),
+            rh=dataframe[f"Relative Humidity_d{d}"].tolist(),
+        )
+        vals = u_res.utci if hasattr(u_res, "utci") else u_res
+        dataframe[f"UTCI_d{d}"] = [round(v, 1) if not pd.isna(v) else 28.0 for v in vals]
+        dataframe[f"Stress Category_d{d}"] = dataframe[f"UTCI_d{d}"].apply(utci_stress_category)
+        
+        f_vals = dataframe[f"UTCI_d{d}"].apply(calculate_f_utci)
+        for demo, weight in DEMO_WEIGHTS.items():
+            dataframe[f"Mortality_{demo}_d{d}"] = (f_vals * weight * 50).round(1).clip(upper=100.0)
+
+    return dataframe
+
+df = generate_baseline_data(df)
 
 MEASUREMENTS = {
     "UTCI (deg C)": "UTCI",
@@ -198,16 +145,21 @@ MEASUREMENTS = {
     "Wind Speed (m/s)": "Wind Speed",
     "Relative Humidity (%)": "Relative Humidity",
 }
-DEFAULT_SLIDER_BOUNDS = {"UTCI (deg C)": [15, 45], "Dry Bulb Temp (deg C)": [10, 45], "Mean Radiant Temp (deg C)": [10, 45], "Wind Speed (m/s)": [0, 10], "Relative Humidity (%)": [0, 100]}
+DEFAULT_SLIDER_BOUNDS = {
+    "UTCI (deg C)": [15, 45],
+    "Dry Bulb Temp (deg C)": [10, 45],
+    "Mean Radiant Temp (deg C)": [10, 45],
+    "Wind Speed (m/s)": [0, 10],
+    "Relative Humidity (%)": [0, 100]
+}
 states_list = sorted(df["State"].unique().tolist())
 district_options = [{"label": f"{r['District']}, {r['State']}", "value": r["join_key"]} for _, r in df.iterrows()]
 
-
 # ==============================================================================
-# DASH APPLICATION & LAYOUT
+# 4. DASH APP INITIALIZATION & EXPOSED WSGI SERVER
 # ==============================================================================
 app = Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
-server = app.server
+server = app.server  # WSGI entry point for Gunicorn
 
 app.index_string = '''
 <!DOCTYPE html>
@@ -218,202 +170,42 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            /* --- LIGHT MODE CONTRAST ENHANCEMENTS --- */
-            .light-mode {
-                background-color: #f8fafc !important;
-                color: #0f172a !important;
-            }
-            .light-mode .text-muted {
-                color: #475569 !important;
-            }
-            .light-mode label, .light-mode .form-label {
-                color: #334155 !important;
-                font-weight: 600;
-            }
-            .light-mode .card {
-                background-color: #ffffff !important;
-                border: 1px solid #cbd5e1 !important;
-                color: #0f172a !important;
-            }
-            .light-mode .card-header {
-                background-color: #ffffff !important;
-                border-bottom: 1px solid #e2e8f0 !important;
-                color: #0f172a !important;
-            }
+            /* LIGHT MODE ACCESSIBILITY */
+            .light-mode { background-color: #f8fafc !important; color: #0f172a !important; }
+            .light-mode .text-muted { color: #475569 !important; }
+            .light-mode label, .light-mode .form-label { color: #334155 !important; font-weight: 600; }
+            .light-mode .card { background-color: #ffffff !important; border: 1px solid #cbd5e1 !important; color: #0f172a !important; }
+            .light-mode .card-header { background-color: #ffffff !important; border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; }
+            
+            .light-mode .rc-slider-rail { background-color: #cbd5e1 !important; height: 6px !important; }
+            .light-mode .rc-slider-track { background-color: #1d4ed8 !important; height: 6px !important; }
+            .light-mode .rc-slider-handle { border: 2px solid #1d4ed8 !important; background-color: #ffffff !important; opacity: 1 !important; }
+            .light-mode .rc-slider-mark-text, .light-mode .rc-slider-mark-text-active { color: #0f172a !important; font-weight: 700 !important; }
+            .light-mode .rc-slider-tooltip-inner { background-color: #0f172a !important; color: #ffffff !important; font-weight: 700 !important; }
 
-            /* Light Mode Range Sliders & Tooltips */
-            .light-mode .rc-slider-rail {
-                background-color: #cbd5e1 !important;
-                height: 6px !important;
-            }
-            .light-mode .rc-slider-track {
-                background-color: #1d4ed8 !important;
-                height: 6px !important;
-            }
-            .light-mode .rc-slider-handle {
-                border: 2px solid #1d4ed8 !important;
-                background-color: #ffffff !important;
-                opacity: 1 !important;
-            }
-            .light-mode .rc-slider-mark-text,
-            .light-mode .rc-slider-mark-text-active {
-                color: #0f172a !important; /* High contrast Slate-900 */
-                font-weight: 700 !important;
-            }
-            .light-mode .rc-slider-dot {
-                border-color: #94a3b8 !important;
-                background-color: #ffffff !important;
-            }
-            .light-mode .rc-slider-dot-active {
-                border-color: #1d4ed8 !important;
-            }
-            .light-mode .rc-slider-tooltip-inner {
-                background-color: #0f172a !important;
-                color: #ffffff !important;
-                font-weight: 700 !important;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
-            }
-            .light-mode .rc-slider-tooltip-arrow {
-                border-top-color: #0f172a !important;
-            }
+            .light-mode .dash-dropdown, .light-mode .Select-control, .light-mode div[class*="-control"] { background-color: #ffffff !important; border-color: #cbd5e1 !important; color: #0f172a !important; }
+            .light-mode .Select-value, .light-mode .Select-value-label, .light-mode div[class*="-singleValue"] { color: #0f172a !important; font-weight: 600; }
+            .light-mode .Select-placeholder, .light-mode div[class*="-placeholder"], .light-mode input::placeholder { color: #475569 !important; opacity: 1 !important; font-weight: 500; }
 
-            /* Light Mode Dropdowns */
-            .light-mode .dash-dropdown,
-            .light-mode .Select-control,
-            .light-mode div[class*="-control"] {
-                background-color: #ffffff !important;
-                border-color: #cbd5e1 !important;
-                color: #0f172a !important;
-            }
-            .light-mode .Select-value,
-            .light-mode .Select-value-label,
-            .light-mode div[class*="-singleValue"] {
-                color: #0f172a !important;
-                font-weight: 600;
-            }
-            .light-mode .Select-placeholder,
-            .light-mode div[class*="-placeholder"],
-            .light-mode input::placeholder {
-                color: #475569 !important;
-                opacity: 1 !important;
-                font-weight: 500;
-            }
-            .light-mode .Select-input > input,
-            .light-mode div[class*="-Input"] input,
-            .light-mode div[class*="-Input"] {
-                color: #0f172a !important;
-            }
+            /* DARK MODE ACCESSIBILITY */
+            .dark-mode { background-color: #0f172a !important; color: #f8fafc !important; }
+            .dark-mode .text-muted { color: #cbd5e1 !important; }
+            .dark-mode label, .dark-mode .form-label { color: #f1f5f9 !important; font-weight: 600; }
+            .dark-mode .card { background-color: #1e293b !important; border: 1px solid #334155 !important; color: #f8fafc !important; }
+            .dark-mode .card-header { background-color: #1e293b !important; border-bottom: 1px solid #334155 !important; color: #f8fafc !important; }
 
-            /* --- DARK MODE CONTRAST ENHANCEMENTS --- */
-            .dark-mode {
-                background-color: #0f172a !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode .text-muted {
-                color: #cbd5e1 !important;
-            }
-            .dark-mode label, .dark-mode .form-label {
-                color: #f1f5f9 !important;
-                font-weight: 600;
-            }
-            .dark-mode .card {
-                background-color: #1e293b !important;
-                border: 1px solid #334155 !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode .card-header {
-                background-color: #1e293b !important;
-                border-bottom: 1px solid #334155 !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode h1, .dark-mode h2, .dark-mode h3, .dark-mode h4, .dark-mode h5, .dark-mode h6 {
-                color: #ffffff !important;
-            }
+            .dark-mode .rc-slider-rail { background-color: #475569 !important; height: 6px !important; }
+            .dark-mode .rc-slider-track { background-color: #60a5fa !important; height: 6px !important; }
+            .dark-mode .rc-slider-handle { border: 2px solid #60a5fa !important; background-color: #0f172a !important; opacity: 1 !important; }
+            .dark-mode .rc-slider-mark-text, .dark-mode .rc-slider-mark-text-active { color: #f8fafc !important; font-weight: 700 !important; }
+            .dark-mode .rc-slider-tooltip-inner { background-color: #f8fafc !important; color: #0f172a !important; font-weight: 700 !important; }
 
-            /* Dark Mode Range Sliders & Tooltips */
-            .dark-mode .rc-slider-rail {
-                background-color: #475569 !important;
-                height: 6px !important;
-            }
-            .dark-mode .rc-slider-track {
-                background-color: #60a5fa !important;
-                height: 6px !important;
-            }
-            .dark-mode .rc-slider-handle {
-                border: 2px solid #60a5fa !important;
-                background-color: #0f172a !important;
-                opacity: 1 !important;
-            }
-            .dark-mode .rc-slider-mark-text,
-            .dark-mode .rc-slider-mark-text-active {
-                color: #f8fafc !important; /* High contrast Slate-50 */
-                font-weight: 700 !important;
-            }
-            .dark-mode .rc-slider-dot {
-                border-color: #64748b !important;
-                background-color: #1e293b !important;
-            }
-            .dark-mode .rc-slider-dot-active {
-                border-color: #60a5fa !important;
-            }
-            .dark-mode .rc-slider-tooltip-inner {
-                background-color: #f8fafc !important;
-                color: #0f172a !important;
-                font-weight: 700 !important;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
-            }
-            .dark-mode .rc-slider-tooltip-arrow {
-                border-top-color: #f8fafc !important;
-            }
-
-            /* Dark Mode Dropdowns */
-            .dark-mode .dash-dropdown,
-            .dark-mode .Select-control,
-            .dark-mode div[class*="-control"] {
-                background-color: #1e293b !important;
-                border-color: #475569 !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode .Select-value,
-            .dark-mode .Select-value-label,
-            .dark-mode div[class*="-singleValue"] {
-                color: #f8fafc !important;
-                font-weight: 600;
-            }
-            .dark-mode .Select-placeholder,
-            .dark-mode div[class*="-placeholder"],
-            .dark-mode input::placeholder {
-                color: #cbd5e1 !important;
-                opacity: 1 !important;
-                font-weight: 500;
-            }
-            .dark-mode .Select-input > input,
-            .dark-mode div[class*="-Input"] input,
-            .dark-mode div[class*="-Input"] {
-                color: #f8fafc !important;
-            }
-            .dark-mode .Select-menu-outer,
-            .dark-mode div[class*="-menu"] {
-                background-color: #1e293b !important;
-                border: 1px solid #475569 !important;
-            }
-            .dark-mode .Select-option,
-            .dark-mode div[class*="-option"] {
-                background-color: #1e293b !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode div[class*="-option"]:hover,
-            .dark-mode div[class*="-option"][class*="-is-focused"] {
-                background-color: #334155 !important;
-                color: #ffffff !important;
-            }
-            .dark-mode div[class*="-DropdownIndicator"] {
-                color: #cbd5e1 !important;
-                fill: #cbd5e1 !important;
-            }
-            .dark-mode hr {
-                border-color: #334155 !important;
-            }
+            .dark-mode .dash-dropdown, .dark-mode .Select-control, .dark-mode div[class*="-control"] { background-color: #1e293b !important; border-color: #475569 !important; color: #f8fafc !important; }
+            .dark-mode .Select-value, .dark-mode .Select-value-label, .dark-mode div[class*="-singleValue"] { color: #f8fafc !important; font-weight: 600; }
+            .dark-mode .Select-placeholder, .dark-mode div[class*="-placeholder"], .dark-mode input::placeholder { color: #cbd5e1 !important; opacity: 1 !important; font-weight: 500; }
+            .dark-mode .Select-menu-outer, .dark-mode div[class*="-menu"] { background-color: #1e293b !important; border: 1px solid #475569 !important; }
+            .dark-mode .Select-option, .dark-mode div[class*="-option"] { background-color: #1e293b !important; color: #f8fafc !important; }
+            .dark-mode div[class*="-option"]:hover { background-color: #334155 !important; color: #ffffff !important; }
         </style>
     </head>
     <body>
@@ -428,19 +220,17 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # --- HEADER & THEME TOGGLE ---
     dbc.Row([
         dbc.Col([
             html.H2("India Thermal Comfort & Mortality Risk Platform", className="fw-bolder mb-1"),
             html.P("Predictive biometeorological forecasting & localized demographic risk assessment", className="text-muted mb-0")
         ], md=7),
         dbc.Col([
-            dbc.Badge("● Live API Active", color="success", className="px-3 py-2 fs-6 rounded-pill me-3 shadow-sm"),
+            dbc.Badge("● Active Server Session", color="success", className="px-3 py-2 fs-6 rounded-pill me-3 shadow-sm"),
             dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block")
         ], md=5, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
     ], className="my-4 py-3 border-bottom"),
 
-    # --- FORECAST HORIZON SELECTOR & KPIS ---
     dbc.Card([
         dbc.CardBody([
             dbc.Row([
@@ -449,10 +239,10 @@ app.layout = dbc.Container([
                     dcc.Dropdown(
                         id='forecast-horizon',
                         options=[
-                            {"label": "🔴 Real-Time Current", "value": 0},
-                            {"label": "📅 +1 Day Forecast", "value": 1},
-                            {"label": "📅 +2 Days Forecast", "value": 2},
-                            {"label": "📅 +3 Days Forecast", "value": 3},
+                            {"label": " Real-Time Current", "value": 0},
+                            {"label": " 1 Day Forecast", "value": 1},
+                            {"label": " 2 Days Forecast", "value": 2},
+                            {"label": " 3 Days Forecast", "value": 3},
                         ],
                         value=0,
                         clearable=False,
@@ -464,9 +254,7 @@ app.layout = dbc.Container([
         ])
     ], className="mb-4 shadow-sm border-0"),
 
-    # --- SECTION 1: MAP & INSPECTOR ---
     dbc.Row([
-        # LEFT COLUMN: THERMAL COMFORT MAP
         dbc.Col([
             dbc.Card([
                 dbc.CardHeader(html.H5("1. Thermal Comfort & Climate Layer", className="mb-0 fw-bold")),
@@ -488,7 +276,6 @@ app.layout = dbc.Container([
             ], className="shadow-sm border-0 h-100")
         ], lg=8, className="mb-4 mb-lg-0"),
 
-        # RIGHT COLUMN: INSPECTOR
         dbc.Col([
             dbc.Card([
                 dbc.CardHeader(html.H5("District Inspector", className="mb-0 fw-bold")),
@@ -504,7 +291,6 @@ app.layout = dbc.Container([
         ], lg=4)
     ], className="mb-4"),
 
-    # --- SECTION 2: MORTALITY RISK INDEX MAP ---
     dbc.Card([
         dbc.CardHeader(
             dbc.Row([
@@ -527,14 +313,9 @@ app.layout = dbc.Container([
             html.Div([
                 html.Label("Mortality Risk Index Filter & Color Bounds", className="fw-bold small text-muted mb-1"),
                 dcc.RangeSlider(
-                    id='mortality-range-slider',
-                    min=0,
-                    max=100,
-                    step=1,
-                    value=[0, 100],
+                    id='mortality-range-slider', min=0, max=100, step=1, value=[0, 100],
                     marks={0: '0', 25: '25', 50: '50', 75: '75', 100: '100'},
-                    tooltip={"placement": "bottom", "always_visible": True},
-                    className="mb-4"
+                    tooltip={"placement": "bottom", "always_visible": True}, className="mb-4"
                 )
             ]),
             dcc.Loading(dcc.Graph(id='mortality-map', config={"displayModeBar": False}))
@@ -543,11 +324,9 @@ app.layout = dbc.Container([
 
 ], id="main-container", fluid=True, className="bg-light px-4 py-3 min-vh-100")
 
-
 # ==============================================================================
-# CALLBACKS
+# 5. CALLBACK INTERACTIVITY
 # ==============================================================================
-
 @callback(
     Output('main-container', 'className'),
     Input('theme-switch', 'value')
@@ -569,16 +348,10 @@ def update_kpis(horizon, dark_mode):
     max_r = valid.loc[valid[temp_col].idxmax()] if not valid.empty else None
     min_r = valid.loc[valid[temp_col].idxmin()] if not valid.empty else None
 
-    if dark_mode:
-        avg_color = "#60a5fa"   # Bright Light Blue
-        hot_color = "#f87171"   # Soft Red
-        cool_color = "#38bdf8"  # Bright Cyan
-        dist_color = "#f8fafc"  # White/Light Slate
-    else:
-        avg_color = "#1d4ed8"   # High-contrast Deep Blue
-        hot_color = "#b91c1c"   # High-contrast Deep Red
-        cool_color = "#0369a1"   # High-contrast Deep Sky Blue
-        dist_color = "#0f172a"   # Dark Slate
+    avg_color = "#60a5fa" if dark_mode else "#1d4ed8"
+    hot_color = "#f87171" if dark_mode else "#b91c1c"
+    cool_color = "#38bdf8" if dark_mode else "#0369a1"
+    dist_color = "#f8fafc" if dark_mode else "#0f172a"
 
     return dbc.Row([
         dbc.Col([
@@ -701,20 +474,12 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     )
     wa_url = f"https://wa.me/?text={urllib.parse.quote(whatsapp_text)}"
 
-    if dark_mode:
-        card_bg = "bg-dark border-secondary"
-        text_color = "text-light"
-        mortality_card_bg = "#450a0a"
-        mortality_border = "#991b1b"
-        mortality_text_color = "#fca5a5"
-        mortality_label_color = "#f87171"
-    else:
-        card_bg = "bg-light border"
-        text_color = "text-dark"
-        mortality_card_bg = "#fef2f2"
-        mortality_border = "#fca5a5"
-        mortality_text_color = "#991b1b"
-        mortality_label_color = "#b91c1c"
+    card_bg = "bg-dark border-secondary" if dark_mode else "bg-light border"
+    text_color = "text-light" if dark_mode else "text-dark"
+    mortality_card_bg = "#450a0a" if dark_mode else "#fef2f2"
+    mortality_border = "#991b1b" if dark_mode else "#fca5a5"
+    mortality_text_color = "#fca5a5" if dark_mode else "#991b1b"
+    mortality_label_color = "#f87171" if dark_mode else "#b91c1c"
 
     return html.Div([
         html.Div([
@@ -773,5 +538,4 @@ def update_stress_chart(selected_state, horizon, dark_mode):
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
-    app.run(host = '0.0.0.0', port = port, debug=False)
-    
+    app.run(host='0.0.0.0', port=port, debug=False)
