@@ -1,3 +1,4 @@
+import os
 from dash import Dash, dcc, html, callback, Input, Output, no_update
 import dash_bootstrap_components as dbc
 import plotly.express as px
@@ -771,5 +772,6 @@ def update_stress_chart(selected_state, horizon, dark_mode):
     return fig
 
 if __name__ == '__main__':
-    app.run(debug=False)
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host = '0.0.0.0', port = port, debug=False)
     
