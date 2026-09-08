@@ -539,6 +539,7 @@ app.layout = dbc.Container([
             ]),
             dcc.Loading(dcc.Graph(id='mortality-map', config={"displayModeBar": False}))
         ])
+    ], className="shadow-sm border-0 mb-5")
 
 ], id="main-container", fluid=True, className="bg-light px-4 py-3 min-vh-100")
 
