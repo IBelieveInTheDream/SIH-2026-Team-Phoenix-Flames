@@ -744,7 +744,7 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
             dbc.Col([html.Span("Wind: ", className="text-muted"), html.B(f"{r[f'Wind Speed_d{horizon}']} m/s")], width=6),
         ], className="small mb-3"),
 
-        dbc.Button(" Share Report via WhatsApp", href=wa_url, target="_blank", color="success", className="w-100 fw-bold")
+        dbc.Button("📱 Share Report via WhatsApp", href=wa_url, target="_blank", color="success", className="w-100 fw-bold")
     ])
 
 @callback(
@@ -772,4 +772,4 @@ def update_stress_chart(selected_state, horizon, dark_mode):
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
-    app.run(host="0.0.0.0", port=port, debug=False
+    app.run(host="0.0.0.0", port=port, debug=False)
