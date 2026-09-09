@@ -9,3 +9,4 @@ gunicorn
 openmeteo-requests
 requests-cache
 retry-requests
+openpyxl
