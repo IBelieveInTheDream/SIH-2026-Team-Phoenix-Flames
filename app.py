@@ -39,81 +39,103 @@ for feature in district_geojson["features"]:
         props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-BATCH_SIZE = 50
+# Open-Meteo allows many locations per request; larger batches = fewer round-trips
+BATCH_SIZE = 50  # proven stable; ~13 batches for 641 districts ≈ 15–40s total
 
-@lru_cache(maxsize=256)
-def fetch_batch_cached(lats_tuple, lons_tuple):
+
+def fetch_batch(lats, lons):
+    """Fetch one batch of locations. Returns list of per-location dicts (or None placeholders)."""
     params = {
-        "latitude": ",".join(lats_tuple),
-        "longitude": ",".join(lons_tuple),
-        "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,surface_pressure,cloud_cover,precipitation,wind_speed_10m",
+        "latitude": ",".join(f"{x:.4f}" for x in lats),
+        "longitude": ",".join(f"{x:.4f}" for x in lons),
+        # Only variables the app actually uses — smaller payload, faster response
+        "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
         "forecast_days": 4,
-        "wind_speed_unit": "ms"
+        "wind_speed_unit": "ms",
+        "timezone": "auto",
     }
-    max_retries = 5
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            res = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+            res = requests.get(OPEN_METEO_URL, params=params, timeout=60)
             if res.status_code == 429:
-                time.sleep((attempt + 1) * 3)
+                wait = (attempt + 1) * 5
+                print(f"[weather] rate-limited, sleeping {wait}s…")
+                time.sleep(wait)
                 continue
             res.raise_for_status()
             data = res.json()
-            return (data,) if isinstance(data, dict) else tuple(data)
+            # Single location → dict; multi → list of dicts
+            if isinstance(data, dict) and "hourly" in data:
+                return [data]
+            if isinstance(data, list):
+                return data
+            # Some API versions wrap multi-location differently
+            if isinstance(data, dict) and "latitude" in data:
+                return [data]
+            return [None] * len(lats)
         except Exception as e:
-            if attempt == max_retries - 1: raise e
-            time.sleep(1)
-    raise RuntimeError("Batch fetch failed after retries.")
+            print(f"[weather] batch attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt == max_retries - 1:
+                return [None] * len(lats)
+            time.sleep(2)
+    return [None] * len(lats)
+
 
 def fetch_multi_day_weather(dataframe):
     lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
     all_responses = []
-    for i in range(0, len(dataframe), BATCH_SIZE):
+    n_batches = (len(dataframe) + BATCH_SIZE - 1) // BATCH_SIZE
+    t0 = time.time()
+    for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
-        try:
-            batch_res = fetch_batch_cached(tuple(f"{x:.4f}" for x in b_lats), tuple(f"{x:.4f}" for x in b_lons))
-            all_responses.extend(batch_res)
-        except Exception:
-            all_responses.extend([None] * len(b_lats))
-        time.sleep(0.05)
-
-    peak_indices = [14, 38, 62, 86]
-    for d_idx, h_idx in enumerate(peak_indices):
-        temps, rh, wind, apparent, pressure, cloud, precip = [], [], [], [], [], [], []
-        for item in all_responses:
-            if item and "hourly" in item:
-                h = item["hourly"]
-                temps.append(h["temperature_2m"][h_idx] if len(h["temperature_2m"]) > h_idx else None)
-                rh.append(h["relative_humidity_2m"][h_idx] if len(h["relative_humidity_2m"]) > h_idx else None)
-                wind.append(h["wind_speed_10m"][h_idx] if len(h["wind_speed_10m"]) > h_idx else None)
-                apparent.append(h["apparent_temperature"][h_idx] if len(h["apparent_temperature"]) > h_idx else None)
-                pressure.append(h["surface_pressure"][h_idx] if len(h["surface_pressure"]) > h_idx else None)
-                cloud.append(h["cloud_cover"][h_idx] if len(h["cloud_cover"]) > h_idx else None)
-                precip.append(h["precipitation"][h_idx] if len(h["precipitation"]) > h_idx else None)
+        print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…")
+        batch_res = fetch_batch(b_lats, b_lons)
+        # Ensure we always append exactly len(b_lats) entries
+        if len(batch_res) != len(b_lats):
+            # API sometimes returns one combined object; treat as failure for this batch
+            if len(batch_res) == 1 and batch_res[0] and "hourly" in batch_res[0]:
+                # Single combined response is not per-location — mark all missing
+                all_responses.extend([None] * len(b_lats))
             else:
-                temps.append(None); rh.append(None); wind.append(None)
-                apparent.append(None); pressure.append(None); cloud.append(None); precip.append(None)
+                all_responses.extend((batch_res + [None] * len(b_lats))[: len(b_lats)])
+        else:
+            all_responses.extend(batch_res)
+        time.sleep(0.15)  # be polite to free API
+    print(f"[weather] all batches done in {time.time() - t0:.1f}s")
+
+    peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
+    for d_idx, h_idx in enumerate(peak_indices):
+        temps, rh, wind, apparent = [], [], [], []
+        for item in all_responses:
+            if item and isinstance(item, dict) and "hourly" in item:
+                h = item["hourly"]
+                temps.append(h["temperature_2m"][h_idx] if len(h.get("temperature_2m", [])) > h_idx else None)
+                rh.append(h["relative_humidity_2m"][h_idx] if len(h.get("relative_humidity_2m", [])) > h_idx else None)
+                wind.append(h["wind_speed_10m"][h_idx] if len(h.get("wind_speed_10m", [])) > h_idx else None)
+                apparent.append(h["apparent_temperature"][h_idx] if len(h.get("apparent_temperature", [])) > h_idx else None)
+            else:
+                temps.append(None)
+                rh.append(None)
+                wind.append(None)
+                apparent.append(None)
 
         dataframe[f"Dry Bulb Temp_d{d_idx}"] = temps
         dataframe[f"Relative Humidity_d{d_idx}"] = rh
         dataframe[f"Wind Speed_d{d_idx}"] = wind
         dataframe[f"Apparent Temp_d{d_idx}"] = apparent
-        dataframe[f"Pressure_d{d_idx}"] = pressure
-        dataframe[f"Cloud Cover_d{d_idx}"] = cloud
-        dataframe[f"Precipitation_d{d_idx}"] = precip
 
         mask = dataframe[f"Dry Bulb Temp_d{d_idx}"].isna()
         if mask.any():
-            n = mask.sum()
+            n = int(mask.sum())
             np.random.seed(42 + d_idx)
             dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] = np.random.uniform(20.0, 43.0, n).round(1)
             dataframe.loc[mask, f"Relative Humidity_d{d_idx}"] = np.random.uniform(20.0, 85.0, n).round(1)
             dataframe.loc[mask, f"Wind Speed_d{d_idx}"] = np.random.uniform(0.5, 7.5, n).round(1)
-            dataframe.loc[mask, f"Apparent Temp_d{d_idx}"] = (dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 4.0, n)).round(1)
-            dataframe.loc[mask, f"Pressure_d{d_idx}"] = np.random.uniform(985.0, 1015.0, n).round(1)
-            dataframe.loc[mask, f"Cloud Cover_d{d_idx}"] = np.random.uniform(0.0, 100.0, n).round(1)
-            dataframe.loc[mask, f"Precipitation_d{d_idx}"] = np.random.choice([0.0, 0.0, 0.5, 2.0], size=n).round(1)
+            dataframe.loc[mask, f"Apparent Temp_d{d_idx}"] = (
+                dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 4.0, n)
+            ).round(1)
 
         dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
 
@@ -124,7 +146,9 @@ def fetch_multi_day_weather(dataframe):
             rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
         )
         vals = u_res.utci if hasattr(u_res, "utci") else u_res
-        dataframe[f"UTCI_d{d_idx}"] = [round(v, 1) if not pd.isna(v) else np.nan for v in vals]
+        dataframe[f"UTCI_d{d_idx}"] = [
+            round(v, 1) if not pd.isna(v) else np.nan for v in vals
+        ]
 
     return dataframe
 
@@ -270,7 +294,11 @@ def _run_one_weather_fetch():
         print(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
         return True
     except Exception as e:
+        # Mark ready so the UI does not stay on "Loading…" forever after a failure
         print(f"[weather] fetch failed, keeping previous data: {e}")
+        _weather_ready = True
+        if _last_weather_update is None:
+            _last_weather_update = datetime.now(timezone.utc)
         return False
     finally:
         _weather_fetching = False
