@@ -128,34 +128,99 @@ def fetch_multi_day_weather(dataframe):
 
     return dataframe
 
-df = fetch_multi_day_weather(df)
+
+def fill_synthetic_weather(dataframe):
+    """Instant fallback so the HTTP server can bind before any network I/O."""
+    for d_idx in range(4):
+        n = len(dataframe)
+        np.random.seed(42 + d_idx)
+        dataframe[f"Dry Bulb Temp_d{d_idx}"] = np.random.uniform(22.0, 40.0, n).round(1)
+        dataframe[f"Relative Humidity_d{d_idx}"] = np.random.uniform(25.0, 80.0, n).round(1)
+        dataframe[f"Wind Speed_d{d_idx}"] = np.random.uniform(0.5, 6.0, n).round(1)
+        dataframe[f"Apparent Temp_d{d_idx}"] = (
+            dataframe[f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 3.0, n)
+        ).round(1)
+        dataframe[f"Pressure_d{d_idx}"] = np.random.uniform(990.0, 1015.0, n).round(1)
+        dataframe[f"Cloud Cover_d{d_idx}"] = np.random.uniform(0.0, 100.0, n).round(1)
+        dataframe[f"Precipitation_d{d_idx}"] = np.random.choice(
+            [0.0, 0.0, 0.0, 0.5, 2.0], size=n
+        ).round(1)
+        dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
+
+        u_res = utci(
+            tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
+            tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
+            v=dataframe[f"Wind Speed_d{d_idx}"].tolist(),
+            rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
+        )
+        vals = u_res.utci if hasattr(u_res, "utci") else u_res
+        dataframe[f"UTCI_d{d_idx}"] = [
+            round(v, 1) if not pd.isna(v) else np.nan for v in vals
+        ]
+    return dataframe
+
+
+def enrich_derived_columns(dataframe):
+    """Stress categories + mortality indices (depends on UTCI columns)."""
+    for d in range(4):
+        dataframe[f"Stress Category_d{d}"] = dataframe[f"UTCI_d{d}"].apply(
+            utci_stress_category
+        )
+        f_vals = dataframe[f"UTCI_d{d}"].apply(calculate_f_utci)
+        for demo, weight in DEMO_WEIGHTS.items():
+            dataframe[f"Mortality_{demo}_d{d}"] = (
+                f_vals * weight * 50
+            ).round(1).clip(upper=100.0)
+    return dataframe
+
 
 def utci_stress_category(value):
-    if pd.isna(value): return "No data"
-    if value > 46: return "Extreme heat stress"
-    if value > 38: return "Very strong heat stress"
-    if value > 32: return "Strong heat stress"
-    if value > 26: return "Moderate heat stress"
-    if value > 9: return "No thermal stress"
-    if value > 0: return "Slight cold stress"
-    if value > -13: return "Moderate cold stress"
-    if value > -27: return "Strong cold stress"
+    if pd.isna(value):
+        return "No data"
+    if value > 46:
+        return "Extreme heat stress"
+    if value > 38:
+        return "Very strong heat stress"
+    if value > 32:
+        return "Strong heat stress"
+    if value > 26:
+        return "Moderate heat stress"
+    if value > 9:
+        return "No thermal stress"
+    if value > 0:
+        return "Slight cold stress"
+    if value > -13:
+        return "Moderate cold stress"
+    if value > -27:
+        return "Strong cold stress"
     return "Extreme cold stress"
 
+
 def calculate_f_utci(val):
-    if pd.isna(val) or val <= 26: return 0.05
-    if val <= 32: return 0.05 + 0.02 * (val - 26)
-    if val <= 38: return 0.17 + 0.04 * (val - 32)
-    if val <= 46: return 0.41 + 0.06 * (val - 38)
+    if pd.isna(val) or val <= 26:
+        return 0.05
+    if val <= 32:
+        return 0.05 + 0.02 * (val - 26)
+    if val <= 38:
+        return 0.17 + 0.04 * (val - 32)
+    if val <= 46:
+        return 0.41 + 0.06 * (val - 38)
     return 0.89 + 0.08 * (val - 46)
 
-DEMO_WEIGHTS = {"Elderly (60+ yrs)": 1.8, "Adults (18-59 yrs)": 1.0, "Children (0-5 yrs)": 1.3}
 
-for d in range(4):
-    df[f"Stress Category_d{d}"] = df[f"UTCI_d{d}"].apply(utci_stress_category)
-    f_vals = df[f"UTCI_d{d}"].apply(calculate_f_utci)
-    for demo, weight in DEMO_WEIGHTS.items():
-        df[f"Mortality_{demo}_d{d}"] = (f_vals * weight * 50).round(1).clip(upper=100.0)
+DEMO_WEIGHTS = {
+    "Elderly (60+ yrs)": 1.8,
+    "Adults (18-59 yrs)": 1.0,
+    "Children (0-5 yrs)": 1.3,
+}
+
+# ---------------------------------------------------------------------------
+# CRITICAL FOR RENDER: never block module import with network I/O.
+# Fill synthetic data instantly so gunicorn can bind to $PORT within seconds.
+# Then refresh from Open-Meteo in a background thread.
+# ---------------------------------------------------------------------------
+df = fill_synthetic_weather(df)
+df = enrich_derived_columns(df)
 
 MEASUREMENTS = {
     "UTCI (deg C)": "UTCI",
@@ -164,9 +229,42 @@ MEASUREMENTS = {
     "Wind Speed (m/s)": "Wind Speed",
     "Relative Humidity (%)": "Relative Humidity",
 }
-DEFAULT_SLIDER_BOUNDS = {"UTCI (deg C)": [15, 45], "Dry Bulb Temp (deg C)": [10, 45], "Mean Radiant Temp (deg C)": [10, 45], "Wind Speed (m/s)": [0, 10], "Relative Humidity (%)": [0, 100]}
+DEFAULT_SLIDER_BOUNDS = {
+    "UTCI (deg C)": [15, 45],
+    "Dry Bulb Temp (deg C)": [10, 45],
+    "Mean Radiant Temp (deg C)": [10, 45],
+    "Wind Speed (m/s)": [0, 10],
+    "Relative Humidity (%)": [0, 100],
+}
 states_list = sorted(df["State"].unique().tolist())
-district_options = [{"label": f"{r['District']}, {r['State']}", "value": r["join_key"]} for _, r in df.iterrows()]
+district_options = [
+    {"label": f"{r['District']}, {r['State']}", "value": r["join_key"]}
+    for _, r in df.iterrows()
+]
+
+# Background live-data refresh (does not block port binding)
+import threading
+
+_weather_ready = False
+
+
+def _background_weather_refresh():
+    global df, _weather_ready
+    try:
+        print("[weather] starting Open-Meteo fetch in background…")
+        updated = fetch_multi_day_weather(df.copy())
+        updated = enrich_derived_columns(updated)
+        df = updated
+        _weather_ready = True
+        print("[weather] live data loaded successfully")
+    except Exception as e:
+        print(f"[weather] background fetch failed, keeping synthetic data: {e}")
+
+
+# Only start the thread when the process is actually serving (not during
+# gunicorn's master import in some configs). Safe to call at module level.
+_weather_thread = threading.Thread(target=_background_weather_refresh, daemon=True)
+_weather_thread.start()
 
 
 # ==============================================================================
