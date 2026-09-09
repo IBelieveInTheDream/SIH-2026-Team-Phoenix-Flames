@@ -242,28 +242,42 @@ district_options = [
     for _, r in df.iterrows()
 ]
 
-# Background live-data refresh (does not block port binding)
+# Background live-data refresh every 3 hours (does not block port binding)
 import threading
+from datetime import datetime, timezone
 
+REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
 _weather_ready = False
+_last_weather_update = None  # UTC timestamp of last successful live fetch
 
 
-def _background_weather_refresh():
-    global df, _weather_ready
-    try:
-        print("[weather] starting Open-Meteo fetch in background…")
-        updated = fetch_multi_day_weather(df.copy())
-        updated = enrich_derived_columns(updated)
-        df = updated
-        _weather_ready = True
-        print("[weather] live data loaded successfully")
-    except Exception as e:
-        print(f"[weather] background fetch failed, keeping synthetic data: {e}")
+def _run_one_weather_fetch():
+    """Fetch live data once and swap into the global df."""
+    global df, _weather_ready, _last_weather_update
+    print(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
+    updated = fetch_multi_day_weather(df.copy())
+    updated = enrich_derived_columns(updated)
+    df = updated
+    _weather_ready = True
+    _last_weather_update = datetime.now(timezone.utc)
+    print(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
 
 
-# Only start the thread when the process is actually serving (not during
-# gunicorn's master import in some configs). Safe to call at module level.
-_weather_thread = threading.Thread(target=_background_weather_refresh, daemon=True)
+def _background_weather_loop():
+    """Daemon loop: fetch immediately, then every REFRESH_INTERVAL_SEC."""
+    while True:
+        try:
+            _run_one_weather_fetch()
+        except Exception as e:
+            print(f"[weather] fetch failed, keeping previous data: {e}")
+        # Sleep in small chunks so the process can shut down cleanly
+        slept = 0
+        while slept < REFRESH_INTERVAL_SEC:
+            time.sleep(min(60, REFRESH_INTERVAL_SEC - slept))
+            slept += 60
+
+
+_weather_thread = threading.Thread(target=_background_weather_loop, daemon=True)
 _weather_thread.start()
 
 
@@ -492,6 +506,9 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
+    # Hidden timer: re-triggers map/KPI callbacks so UI picks up 3-hourly data refreshes
+    dcc.Interval(id="data-refresh-interval", interval=5 * 60 * 1000, n_intervals=0),  # every 5 min
+
     # --- HEADER & THEME TOGGLE ---
     dbc.Row([
         dbc.Col([
@@ -499,7 +516,7 @@ app.layout = dbc.Container([
             html.P("Predictive biometeorological forecasting & localized demographic risk assessment", className="text-muted mb-0")
         ], md=7),
         dbc.Col([
-            dbc.Badge("● Live API Active", color="success", className="px-3 py-2 fs-6 rounded-pill me-3 shadow-sm"),
+            html.Span(id="live-status-badge", className="me-3"),
             dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block")
         ], md=5, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
     ], className="my-4 py-3 border-bottom"),
@@ -619,12 +636,34 @@ app.layout = dbc.Container([
 def update_app_theme(dark_mode):
     return "dark-mode bg-dark text-light px-4 py-3 min-vh-100" if dark_mode else "light-mode bg-light text-dark px-4 py-3 min-vh-100"
 
+
+@callback(
+    Output('live-status-badge', 'children'),
+    Input('data-refresh-interval', 'n_intervals'),
+)
+def update_live_badge(_n):
+    if _weather_ready and _last_weather_update is not None:
+        # Show time in IST-friendly short form
+        ts = _last_weather_update.strftime("%H:%M UTC")
+        return dbc.Badge(
+            f"● Live · updated {ts} · refreshes every 3h",
+            color="success",
+            className="px-3 py-2 fs-6 rounded-pill shadow-sm",
+        )
+    return dbc.Badge(
+        "● Loading live weather…",
+        color="warning",
+        className="px-3 py-2 fs-6 rounded-pill shadow-sm",
+    )
+
+
 @callback(
     Output('kpi-summary-container', 'children'),
     Input('forecast-horizon', 'value'),
-    Input('theme-switch', 'value')
+    Input('theme-switch', 'value'),
+    Input('data-refresh-interval', 'n_intervals'),
 )
-def update_kpis(horizon, dark_mode):
+def update_kpis(horizon, dark_mode, _n):
     utci_col = f"UTCI_d{horizon}"
     temp_col = f"Dry Bulb Temp_d{horizon}"
     
@@ -685,9 +724,10 @@ def update_slider_limits(measurement_chosen, horizon):
     Output('district-map', 'figure'),
     Input('measurements', 'value'), Input('state-filter', 'value'),
     Input('color-range-slider', 'value'), Input('forecast-horizon', 'value'),
-    Input('theme-switch', 'value')
+    Input('theme-switch', 'value'),
+    Input('data-refresh-interval', 'n_intervals'),
 )
-def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode):
+def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode, _n):
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
     r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
@@ -708,9 +748,10 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     Output('mortality-map', 'figure'),
     Input('demographic-class', 'value'), Input('state-filter', 'value'),
     Input('forecast-horizon', 'value'), Input('mortality-range-slider', 'value'),
-    Input('theme-switch', 'value')
+    Input('theme-switch', 'value'),
+    Input('data-refresh-interval', 'n_intervals'),
 )
-def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode):
+def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _n):
     target_col = f"Mortality_{demo_class}_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
 
@@ -759,7 +800,7 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     whatsapp_text = (
         f"🌡️ *Thermal & Mortality Risk Alert ({h_label}) - {r['District']}, {r['State']}*\n\n"
         f"• *UTCI Stress:* {r[f'UTCI_d{horizon}']}°C ({r[f'Stress Category_d{horizon}']})\n"
-        f"• *Mortality Index ({demo_class}):* {m_idx}/1000\n"
+        f"• *Mortality Index ({demo_class}):* {m_idx}/100\n"
         f"• *Air Temp:* {r[f'Dry Bulb Temp_d{horizon}']}°C (Feels like {r[f'Apparent Temp_d{horizon}']}°C)\n"
         f"• *Humidity:* {r[f'Relative Humidity_d{horizon}']}%"
     )
@@ -815,9 +856,10 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
 @callback(
     Output('stress-dist-chart', 'figure'),
     Input('state-filter', 'value'), Input('forecast-horizon', 'value'),
-    Input('theme-switch', 'value')
+    Input('theme-switch', 'value'),
+    Input('data-refresh-interval', 'n_intervals'),
 )
-def update_stress_chart(selected_state, horizon, dark_mode):
+def update_stress_chart(selected_state, horizon, dark_mode, _n):
     target_col = f"Stress Category_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
     counts = filtered_df[target_col].value_counts().reset_index()
