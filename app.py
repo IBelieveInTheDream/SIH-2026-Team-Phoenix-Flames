@@ -248,33 +248,52 @@ from datetime import datetime, timezone
 
 REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
 _weather_ready = False
+_weather_fetching = False
 _last_weather_update = None  # UTC timestamp of last successful live fetch
+_weather_lock = threading.Lock()
 
 
 def _run_one_weather_fetch():
-    """Fetch live data once and swap into the global df."""
-    global df, _weather_ready, _last_weather_update
-    print(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
-    updated = fetch_multi_day_weather(df.copy())
-    updated = enrich_derived_columns(updated)
-    df = updated
-    _weather_ready = True
-    _last_weather_update = datetime.now(timezone.utc)
-    print(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
+    """Fetch live data once and swap into the global df. Thread-safe."""
+    global df, _weather_ready, _last_weather_update, _weather_fetching
+    if not _weather_lock.acquire(blocking=False):
+        print("[weather] fetch already in progress, skipping")
+        return False
+    _weather_fetching = True
+    try:
+        print(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
+        updated = fetch_multi_day_weather(df.copy())
+        updated = enrich_derived_columns(updated)
+        df = updated
+        _weather_ready = True
+        _last_weather_update = datetime.now(timezone.utc)
+        print(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
+        return True
+    except Exception as e:
+        print(f"[weather] fetch failed, keeping previous data: {e}")
+        return False
+    finally:
+        _weather_fetching = False
+        _weather_lock.release()
 
 
 def _background_weather_loop():
     """Daemon loop: fetch immediately, then every REFRESH_INTERVAL_SEC."""
     while True:
-        try:
-            _run_one_weather_fetch()
-        except Exception as e:
-            print(f"[weather] fetch failed, keeping previous data: {e}")
-        # Sleep in small chunks so the process can shut down cleanly
+        _run_one_weather_fetch()
         slept = 0
         while slept < REFRESH_INTERVAL_SEC:
             time.sleep(min(60, REFRESH_INTERVAL_SEC - slept))
             slept += 60
+
+
+def trigger_manual_weather_refresh():
+    """Start a one-off fetch in a daemon thread (used by Update Data button)."""
+    if _weather_fetching:
+        return False
+    t = threading.Thread(target=_run_one_weather_fetch, daemon=True)
+    t.start()
+    return True
 
 
 _weather_thread = threading.Thread(target=_background_weather_loop, daemon=True)
@@ -506,8 +525,9 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # Hidden timer: re-triggers map/KPI callbacks so UI picks up 3-hourly data refreshes
-    dcc.Interval(id="data-refresh-interval", interval=5 * 60 * 1000, n_intervals=0),  # every 5 min
+    # Timers: maps/KPIs every 5 min; badge/button state every 15 s (picks up manual refresh finish)
+    dcc.Interval(id="data-refresh-interval", interval=5 * 60 * 1000, n_intervals=0),
+    dcc.Interval(id="status-poll-interval", interval=15 * 1000, n_intervals=0),
 
     # --- HEADER & THEME TOGGLE ---
     dbc.Row([
@@ -516,7 +536,15 @@ app.layout = dbc.Container([
             html.P("Predictive biometeorological forecasting & localized demographic risk assessment", className="text-muted mb-0")
         ], md=7),
         dbc.Col([
-            html.Span(id="live-status-badge", className="me-3"),
+            html.Span(id="live-status-badge", className="me-2"),
+            dbc.Button(
+                "↻ Update data",
+                id="btn-update-data",
+                color="primary",
+                outline=True,
+                size="sm",
+                className="me-3 fw-bold",
+            ),
             dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block")
         ], md=5, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
     ], className="my-4 py-3 border-bottom"),
@@ -639,22 +667,44 @@ def update_app_theme(dark_mode):
 
 @callback(
     Output('live-status-badge', 'children'),
-    Input('data-refresh-interval', 'n_intervals'),
+    Output('btn-update-data', 'disabled'),
+    Output('btn-update-data', 'children'),
+    Input('status-poll-interval', 'n_intervals'),
+    Input('btn-update-data', 'n_clicks'),
+    prevent_initial_call=False,
 )
-def update_live_badge(_n):
+def update_live_badge_and_button(_n, n_clicks):
+    from dash import ctx
+
+    # Manual click → kick off a background fetch (non-blocking)
+    clicked = ctx.triggered_id == "btn-update-data" and bool(n_clicks)
+    if clicked:
+        trigger_manual_weather_refresh()
+
+    # Show updating state right after click or while a fetch is running
+    if clicked or _weather_fetching:
+        badge = dbc.Badge(
+            "● Updating live weather…",
+            color="info",
+            className="px-3 py-2 fs-6 rounded-pill shadow-sm",
+        )
+        return badge, True, "↻ Updating…"
+
     if _weather_ready and _last_weather_update is not None:
-        # Show time in IST-friendly short form
         ts = _last_weather_update.strftime("%H:%M UTC")
-        return dbc.Badge(
+        badge = dbc.Badge(
             f"● Live · updated {ts} · refreshes every 3h",
             color="success",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-    return dbc.Badge(
+        return badge, False, "↻ Update data"
+
+    badge = dbc.Badge(
         "● Loading live weather…",
         color="warning",
         className="px-3 py-2 fs-6 rounded-pill shadow-sm",
     )
+    return badge, False, "↻ Update data"
 
 
 @callback(
