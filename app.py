@@ -759,7 +759,7 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     whatsapp_text = (
         f"🌡️ *Thermal & Mortality Risk Alert ({h_label}) - {r['District']}, {r['State']}*\n\n"
         f"• *UTCI Stress:* {r[f'UTCI_d{horizon}']}°C ({r[f'Stress Category_d{horizon}']})\n"
-        f"• *Mortality Index ({demo_class}):* {m_idx}/100\n"
+        f"• *Mortality Index ({demo_class}):* {m_idx}/1000\n"
         f"• *Air Temp:* {r[f'Dry Bulb Temp_d{horizon}']}°C (Feels like {r[f'Apparent Temp_d{horizon}']}°C)\n"
         f"• *Humidity:* {r[f'Relative Humidity_d{horizon}']}%"
     )
