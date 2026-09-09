@@ -24,11 +24,25 @@ Do **not** upload the original 26 MB GeoJSON.
 | Start Command        | `gunicorn app:server --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT` |
 | Instance Type        | Free or Starter (512 MB)                   |
 
+### Critical: Start Command (fixes "No open ports detected")
+
+Copy this **exactly**:
+
+```
+gunicorn app:server --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT
+```
+
+Common mistakes that cause **Port scan timeout / No open ports**:
+- Using `python app.py` instead of gunicorn
+- Forgetting `--bind 0.0.0.0:$PORT`
+- Using more than 1 worker on free tier (OOM → process dies before binding)
+
 ### Why these flags?
 
 - `--workers 1` – only one process; each extra worker multiplies memory
-- `--threads 2` – still handles a few concurrent users without more RAM
-- `--timeout 120` – first request after cold start can take time (weather API)
+- `--threads 2` – handles a few concurrent users without more RAM
+- `--timeout 120` – background weather refresh can take a while
+- `--bind 0.0.0.0:$PORT` – **required** so Render's health check finds the port
 
 ## Environment variables (optional)
 
@@ -36,7 +50,7 @@ Do **not** upload the original 26 MB GeoJSON.
 |------------------|-----------------------------|----------------------------------|
 | `CENTROIDS_FILE` | `district_centroids.xlsx`   | Path to Excel                    |
 | `GEOJSON_FILE`   | `India-Districts-slim.json` | Path to slim GeoJSON             |
-| `PORT`           | set by Render               | already handled in app.py        |
+| `PORT`           | set by Render               | already handled by gunicorn      |
 
 ## Expected memory after these changes
 
@@ -48,16 +62,16 @@ Do **not** upload the original 26 MB GeoJSON.
 | Dash / Plotly runtime        | 50–100 MB     |
 | **Total (typical)**          | **~250–400 MB** |
 
-This should stay comfortably under the 512 MB hard limit on Render free/starter instances.
+This should stay under the 512 MB hard limit.
 
-## Cold-start note
+## How startup works now (avoids port timeout)
 
-On free tier the service spins down after inactivity. The first request after wake-up will:
+1. Process starts → loads Excel + slim GeoJSON (fast, ~1–3 s)
+2. Fills **synthetic** weather data instantly
+3. **Binds to $PORT immediately** → Render health check succeeds
+4. Background thread fetches real Open-Meteo data and swaps it in
 
-1. Load the slim GeoJSON + Excel
-2. Call Open-Meteo for all 641 districts (batched)
-
-This can take 30–90 seconds. The `--timeout 120` prevents gunicorn from killing the process.
+You no longer wait for the weather API before the port opens.
 
 ## Regenerating the slim GeoJSON later
 
