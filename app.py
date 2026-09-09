@@ -60,7 +60,7 @@ def fetch_batch(lats, lons):
             res = requests.get(OPEN_METEO_URL, params=params, timeout=60)
             if res.status_code == 429:
                 wait = (attempt + 1) * 5
-                print(f"[weather] rate-limited, sleeping {wait}s…")
+                print(f"[weather] rate-limited, sleeping {wait}s…", flush=True)
                 time.sleep(wait)
                 continue
             res.raise_for_status()
@@ -75,7 +75,7 @@ def fetch_batch(lats, lons):
                 return [data]
             return [None] * len(lats)
         except Exception as e:
-            print(f"[weather] batch attempt {attempt + 1}/{max_retries} failed: {e}")
+            print(f"[weather] batch attempt {attempt + 1}/{max_retries} failed: {e}", flush=True)
             if attempt == max_retries - 1:
                 return [None] * len(lats)
             time.sleep(2)
@@ -90,7 +90,7 @@ def fetch_multi_day_weather(dataframe):
     for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
-        print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…")
+        print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…", flush=True)
         batch_res = fetch_batch(b_lats, b_lons)
         # Ensure we always append exactly len(b_lats) entries
         if len(batch_res) != len(b_lats):
@@ -103,7 +103,7 @@ def fetch_multi_day_weather(dataframe):
         else:
             all_responses.extend(batch_res)
         time.sleep(0.15)  # be polite to free API
-    print(f"[weather] all batches done in {time.time() - t0:.1f}s")
+    print(f"[weather] all batches done in {time.time() - t0:.1f}s", flush=True)
 
     peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
     for d_idx, h_idx in enumerate(peak_indices):
@@ -268,6 +268,7 @@ district_options = [
 
 # Background live-data refresh every 3 hours (does not block port binding)
 import threading
+import sys
 from datetime import datetime, timezone
 
 REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
@@ -275,27 +276,34 @@ _weather_ready = False
 _weather_fetching = False
 _last_weather_update = None  # UTC timestamp of last successful live fetch
 _weather_lock = threading.Lock()
+_weather_thread_started = False
+_weather_thread_start_lock = threading.Lock()
+
+
+def _wlog(msg):
+    """Log to stdout with flush so Gunicorn/Render always shows the line."""
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 def _run_one_weather_fetch():
     """Fetch live data once and swap into the global df. Thread-safe."""
     global df, _weather_ready, _last_weather_update, _weather_fetching
     if not _weather_lock.acquire(blocking=False):
-        print("[weather] fetch already in progress, skipping")
+        _wlog("[weather] fetch already in progress, skipping")
         return False
     _weather_fetching = True
     try:
-        print(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
+        _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
         updated = fetch_multi_day_weather(df.copy())
         updated = enrich_derived_columns(updated)
         df = updated
         _weather_ready = True
         _last_weather_update = datetime.now(timezone.utc)
-        print(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
+        _wlog(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
         return True
     except Exception as e:
-        # Mark ready so the UI does not stay on "Loading…" forever after a failure
-        print(f"[weather] fetch failed, keeping previous data: {e}")
+        _wlog(f"[weather] fetch failed, keeping previous data: {e}")
         _weather_ready = True
         if _last_weather_update is None:
             _last_weather_update = datetime.now(timezone.utc)
@@ -307,6 +315,7 @@ def _run_one_weather_fetch():
 
 def _background_weather_loop():
     """Daemon loop: fetch immediately, then every REFRESH_INTERVAL_SEC."""
+    _wlog("[weather] background loop started")
     while True:
         _run_one_weather_fetch()
         slept = 0
@@ -315,8 +324,21 @@ def _background_weather_loop():
             slept += 60
 
 
+def ensure_weather_thread_started():
+    """Start the background loop once (safe under Gunicorn workers)."""
+    global _weather_thread_started
+    with _weather_thread_start_lock:
+        if _weather_thread_started:
+            return
+        _weather_thread_started = True
+        t = threading.Thread(target=_background_weather_loop, daemon=True, name="weather-loop")
+        t.start()
+        _wlog("[weather] background thread launched")
+
+
 def trigger_manual_weather_refresh():
     """Start a one-off fetch in a daemon thread (used by Update Data button)."""
+    ensure_weather_thread_started()
     if _weather_fetching:
         return False
     t = threading.Thread(target=_run_one_weather_fetch, daemon=True)
@@ -324,15 +346,18 @@ def trigger_manual_weather_refresh():
     return True
 
 
-_weather_thread = threading.Thread(target=_background_weather_loop, daemon=True)
-_weather_thread.start()
-
-
 # ==============================================================================
 # DASH APPLICATION & LAYOUT
 # ==============================================================================
 app = Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 server = app.server
+
+
+@server.before_request
+def _start_weather_on_first_request():
+    """Gunicorn-safe: launch the weather loop on the first HTTP request."""
+    ensure_weather_thread_started()
+
 
 app.index_string = '''
 <!DOCTYPE html>
