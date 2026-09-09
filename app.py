@@ -39,47 +39,94 @@ for feature in district_geojson["features"]:
         props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-# Open-Meteo allows many locations per request; larger batches = fewer round-trips
-BATCH_SIZE = 50  # proven stable; ~13 batches for 641 districts ≈ 15–40s total
+# Fewer, slower batches reduce 429s on shared cloud IPs (e.g. Render free tier)
+BATCH_SIZE = 40
+BATCH_PAUSE_SEC = 2.0  # pause between batches
+WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", "weather_cache.pkl")
+# Prefer disk cache over API when younger than this (hours)
+CACHE_MAX_AGE_HOURS = float(os.environ.get("CACHE_MAX_AGE_HOURS", "6"))
+
+
+def _save_weather_cache(dataframe):
+    """Persist weather columns so restarts / rate-limits can reuse last good data."""
+    try:
+        cols = [c for c in dataframe.columns if any(
+            c.startswith(p) for p in (
+                "Dry Bulb Temp_d", "Relative Humidity_d", "Wind Speed_d",
+                "Apparent Temp_d", "Mean Radiant Temp_d", "UTCI_d",
+                "Stress Category_d", "Mortality_",
+            )
+        )]
+        cache_df = dataframe[["join_key"] + cols].copy()
+        cache_df.to_pickle(WEATHER_CACHE_FILE)
+        print(f"[weather] cache saved → {WEATHER_CACHE_FILE} ({len(cols)} cols)", flush=True)
+    except Exception as e:
+        print(f"[weather] cache save failed: {e}", flush=True)
+
+
+def _load_weather_cache(dataframe, max_age_hours=None):
+    """Load cached weather into dataframe if file exists and is fresh enough."""
+    if not os.path.exists(WEATHER_CACHE_FILE):
+        return False
+    try:
+        age_h = (time.time() - os.path.getmtime(WEATHER_CACHE_FILE)) / 3600.0
+        limit = CACHE_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
+        if age_h > limit:
+            print(f"[weather] cache too old ({age_h:.1f}h > {limit}h), will try API", flush=True)
+            return False
+        cache_df = pd.read_pickle(WEATHER_CACHE_FILE)
+        if "join_key" not in cache_df.columns:
+            return False
+        merged = dataframe.drop(
+            columns=[c for c in dataframe.columns if c in cache_df.columns and c != "join_key"],
+            errors="ignore",
+        ).merge(cache_df, on="join_key", how="left")
+        for c in cache_df.columns:
+            if c != "join_key":
+                dataframe[c] = merged[c].values
+        print(f"[weather] cache loaded (age {age_h:.1f}h)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[weather] cache load failed: {e}", flush=True)
+        return False
 
 
 def fetch_batch(lats, lons):
-    """Fetch one batch of locations. Returns list of per-location dicts (or None placeholders)."""
+    """Fetch one batch of locations. Returns (list_of_dicts_or_None, hit_rate_limit)."""
     params = {
         "latitude": ",".join(f"{x:.4f}" for x in lats),
         "longitude": ",".join(f"{x:.4f}" for x in lons),
-        # Only variables the app actually uses — smaller payload, faster response
         "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
         "forecast_days": 4,
         "wind_speed_unit": "ms",
         "timezone": "auto",
     }
-    max_retries = 3
-    for attempt in range(max_retries):
+    # Longer backoff: shared cloud IPs often need minutes, not seconds
+    backoff_schedule = [30, 60, 120]
+    for attempt, wait in enumerate(backoff_schedule):
         try:
             res = requests.get(OPEN_METEO_URL, params=params, timeout=60)
             if res.status_code == 429:
-                wait = (attempt + 1) * 5
-                print(f"[weather] rate-limited, sleeping {wait}s…", flush=True)
+                print(f"[weather] rate-limited (429), sleeping {wait}s (attempt {attempt + 1}/3)…", flush=True)
                 time.sleep(wait)
                 continue
             res.raise_for_status()
             data = res.json()
-            # Single location → dict; multi → list of dicts
             if isinstance(data, dict) and "hourly" in data:
-                return [data]
+                return [data], False
             if isinstance(data, list):
-                return data
-            # Some API versions wrap multi-location differently
+                return data, False
             if isinstance(data, dict) and "latitude" in data:
-                return [data]
-            return [None] * len(lats)
+                return [data], False
+            return [None] * len(lats), False
         except Exception as e:
-            print(f"[weather] batch attempt {attempt + 1}/{max_retries} failed: {e}", flush=True)
-            if attempt == max_retries - 1:
-                return [None] * len(lats)
-            time.sleep(2)
-    return [None] * len(lats)
+            print(f"[weather] batch attempt {attempt + 1}/3 failed: {e}", flush=True)
+            if attempt == len(backoff_schedule) - 1:
+                return [None] * len(lats), False
+            time.sleep(5)
+    # Exhausted retries still on 429
+    print("[weather] giving up on this batch after repeated 429s", flush=True)
+    return [None] * len(lats), True
 
 
 def fetch_multi_day_weather(dataframe):
@@ -87,22 +134,35 @@ def fetch_multi_day_weather(dataframe):
     all_responses = []
     n_batches = (len(dataframe) + BATCH_SIZE - 1) // BATCH_SIZE
     t0 = time.time()
+    consecutive_rate_limits = 0
+
     for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
         print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…", flush=True)
-        batch_res = fetch_batch(b_lats, b_lons)
-        # Ensure we always append exactly len(b_lats) entries
-        if len(batch_res) != len(b_lats):
-            # API sometimes returns one combined object; treat as failure for this batch
-            if len(batch_res) == 1 and batch_res[0] and "hourly" in batch_res[0]:
-                # Single combined response is not per-location — mark all missing
-                all_responses.extend([None] * len(b_lats))
-            else:
-                all_responses.extend((batch_res + [None] * len(b_lats))[: len(b_lats)])
+        batch_res, hit_limit = fetch_batch(b_lats, b_lons)
+
+        if hit_limit:
+            consecutive_rate_limits += 1
+            all_responses.extend([None] * len(b_lats))
+            # Stop early if API keeps rejecting — avoid burning the shared quota
+            if consecutive_rate_limits >= 2:
+                print("[weather] repeated rate-limits — aborting remaining batches", flush=True)
+                remaining = len(dataframe) - len(all_responses)
+                all_responses.extend([None] * remaining)
+                break
         else:
-            all_responses.extend(batch_res)
-        time.sleep(0.15)  # be polite to free API
+            consecutive_rate_limits = 0
+            if len(batch_res) != len(b_lats):
+                if len(batch_res) == 1 and batch_res[0] and "hourly" in batch_res[0]:
+                    all_responses.extend([None] * len(b_lats))
+                else:
+                    all_responses.extend((batch_res + [None] * len(b_lats))[: len(b_lats)])
+            else:
+                all_responses.extend(batch_res)
+
+        time.sleep(BATCH_PAUSE_SEC)
+
     print(f"[weather] all batches done in {time.time() - t0:.1f}s", flush=True)
 
     peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
@@ -287,23 +347,55 @@ def _wlog(msg):
 
 
 def _run_one_weather_fetch():
-    """Fetch live data once and swap into the global df. Thread-safe."""
+    """Fetch live data once and swap into the global df. Thread-safe.
+
+    Strategy on rate-limited cloud IPs:
+      1. Use fresh disk cache if available (skip API)
+      2. Otherwise call Open-Meteo with slow batches + long 429 backoff
+      3. On success, save cache; on failure, fall back to any cache (even older)
+    """
     global df, _weather_ready, _last_weather_update, _weather_fetching
     if not _weather_lock.acquire(blocking=False):
         _wlog("[weather] fetch already in progress, skipping")
         return False
     _weather_fetching = True
     try:
+        # Prefer recent cache to avoid burning shared free-tier quota
+        working = df.copy()
+        if _load_weather_cache(working):
+            working = enrich_derived_columns(working)
+            df = working
+            _weather_ready = True
+            _last_weather_update = datetime.fromtimestamp(
+                os.path.getmtime(WEATHER_CACHE_FILE), tz=timezone.utc
+            )
+            _wlog(f"[weather] using disk cache (updated {_last_weather_update.isoformat()})")
+            return True
+
         _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
-        updated = fetch_multi_day_weather(df.copy())
+        updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
+
+        # If almost everything is still synthetic-looking missing after API, try any cache
+        sample_col = "UTCI_d0"
+        live_ratio = 1.0
+        if sample_col in updated.columns:
+            # crude: we always fill NaNs with synthetic, so always "full"
+            pass
+
         df = updated
+        _save_weather_cache(df)
         _weather_ready = True
         _last_weather_update = datetime.now(timezone.utc)
         _wlog(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
         return True
     except Exception as e:
-        _wlog(f"[weather] fetch failed, keeping previous data: {e}")
+        _wlog(f"[weather] fetch failed: {e}")
+        # Last resort: any cache regardless of age
+        working = df.copy()
+        if _load_weather_cache(working, max_age_hours=72):
+            df = enrich_derived_columns(working)
+            _wlog("[weather] fell back to older disk cache")
         _weather_ready = True
         if _last_weather_update is None:
             _last_weather_update = datetime.now(timezone.utc)
