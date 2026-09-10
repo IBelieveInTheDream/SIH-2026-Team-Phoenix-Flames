@@ -1,5 +1,5 @@
 import os
-from dash import Dash, dcc, html, callback, Input, Output, no_update
+from dash import Dash, dcc, html, callback, Input, Output, State, no_update
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import pandas as pd
@@ -440,13 +440,20 @@ def ensure_weather_thread_started():
 def trigger_manual_weather_refresh():
     """Start a forced live fetch (Update data button). Always hits the API."""
     ensure_weather_thread_started()
+    _wlog("[weather] === MANUAL Update data clicked ===")
     if _weather_fetching:
-        _wlog("[weather] manual update ignored — fetch already running")
+        _wlog("[weather] manual update ignored — another fetch is still running")
         return False
-    _wlog("[weather] manual Update data clicked")
-    t = threading.Thread(
-        target=_run_one_weather_fetch, kwargs={"force": True}, daemon=True, name="weather-manual"
-    )
+
+    def _manual_job():
+        try:
+            _wlog("[weather] manual job thread started (force=True)")
+            ok = _run_one_weather_fetch(force=True)
+            _wlog(f"[weather] manual job finished ok={ok}")
+        except Exception as e:
+            _wlog(f"[weather] manual job crashed: {e}")
+
+    t = threading.Thread(target=_manual_job, daemon=True, name="weather-manual")
     t.start()
     return True
 
@@ -683,8 +690,8 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # 5 min poll: maps only refresh on this cadence (or when controls change), not every few seconds
-    dcc.Interval(id="status-poll-interval", interval=5 * 60 * 1000, n_intervals=0),
+    # Fast status poll (badge/button only). Maps refresh only when data-version actually changes.
+    dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
 
     # --- HEADER & THEME TOGGLE ---
@@ -830,30 +837,31 @@ def update_app_theme(dark_mode):
     Output('data-version', 'data'),
     Input('status-poll-interval', 'n_intervals'),
     Input('btn-update-data', 'n_clicks'),
+    State('data-version', 'data'),
     prevent_initial_call=False,
 )
-def update_live_badge_and_button(_n, n_clicks):
+def update_live_badge_and_button(_n, n_clicks, current_version):
     from dash import ctx, no_update
 
-    # Only change data-version when weather data actually changes (avoids map redraw churn)
     version = (
         f"{_weather_source}|{_last_weather_update.isoformat()}"
         if _last_weather_update is not None
         else f"{_weather_source}|init"
     )
+    # Only push a new data-version when data actually changed → maps redraw at most then
+    version_out = version if version != current_version else no_update
 
     clicked = ctx.triggered_id == "btn-update-data" and bool(n_clicks)
     if clicked:
         trigger_manual_weather_refresh()
 
-    if clicked or _weather_fetching:
+    if _weather_fetching or (clicked and ctx.triggered_id == "btn-update-data"):
         badge = dbc.Badge(
             "● Updating…",
             color="info",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-        # Don't bump data-version while still fetching — maps stay interactive
-        return badge, True, "↻ Updating…", no_update
+        return badge, True, "↻ Updating…", version_out
 
     if _weather_ready:
         ts = (
@@ -868,14 +876,14 @@ def update_live_badge_and_button(_n, n_clicks):
         else:
             text, color = "● Demo data · API busy — try Update later", "warning"
         badge = dbc.Badge(text, color=color, className="px-3 py-2 fs-6 rounded-pill shadow-sm")
-        return badge, False, "↻ Update data", version
+        return badge, False, "↻ Update data", version_out
 
     badge = dbc.Badge(
         "● Starting…",
         color="secondary",
         className="px-3 py-2 fs-6 rounded-pill shadow-sm",
     )
-    return badge, False, "↻ Update data", version
+    return badge, False, "↻ Update data", version_out
 
 
 @callback(
