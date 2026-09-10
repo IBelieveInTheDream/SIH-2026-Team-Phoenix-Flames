@@ -357,12 +357,11 @@ def _wlog(msg):
     sys.stdout.flush()
 
 
-def _run_one_weather_fetch():
-    """Fetch live data once. Never blocks the UI for more than ~FETCH_MAX_SECONDS.
+def _run_one_weather_fetch(force=False):
+    """Fetch live data once.
 
-    Render free tier spins down ~15 min idle and wipes disk cache, so every
-    cold start may hit Open-Meteo rate limits on a shared IP. We fail fast and
-    keep serving synthetic/cache data instead of staying on 'Updating…'.
+    force=False (auto loop): use fresh disk cache if available, else call API.
+    force=True  (Update data button): always call Open-Meteo (skip cache).
     """
     global df, _weather_ready, _last_weather_update, _weather_fetching, _weather_source
     if not _weather_lock.acquire(blocking=False):
@@ -371,7 +370,8 @@ def _run_one_weather_fetch():
     _weather_fetching = True
     try:
         working = df.copy()
-        if _load_weather_cache(working):
+
+        if not force and _load_weather_cache(working):
             df = enrich_derived_columns(working)
             _weather_ready = True
             _weather_source = "cache"
@@ -381,7 +381,11 @@ def _run_one_weather_fetch():
             _wlog(f"[weather] using disk cache ({_last_weather_update.isoformat()})")
             return True
 
-        _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
+        if force:
+            _wlog("[weather] MANUAL update requested — calling Open-Meteo (skipping cache)")
+        else:
+            _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
+
         updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
         df = updated
@@ -434,11 +438,15 @@ def ensure_weather_thread_started():
 
 
 def trigger_manual_weather_refresh():
-    """Start a one-off fetch in a daemon thread (used by Update Data button)."""
+    """Start a forced live fetch (Update data button). Always hits the API."""
     ensure_weather_thread_started()
     if _weather_fetching:
+        _wlog("[weather] manual update ignored — fetch already running")
         return False
-    t = threading.Thread(target=_run_one_weather_fetch, daemon=True)
+    _wlog("[weather] manual Update data clicked")
+    t = threading.Thread(
+        target=_run_one_weather_fetch, kwargs={"force": True}, daemon=True, name="weather-manual"
+    )
     t.start()
     return True
 
@@ -675,8 +683,8 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # Poll often so UI picks up background weather updates; data-version bumps when df changes
-    dcc.Interval(id="status-poll-interval", interval=10 * 1000, n_intervals=0),
+    # 5 min poll: maps only refresh on this cadence (or when controls change), not every few seconds
+    dcc.Interval(id="status-poll-interval", interval=5 * 60 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
 
     # --- HEADER & THEME TOGGLE ---
@@ -825,9 +833,9 @@ def update_app_theme(dark_mode):
     prevent_initial_call=False,
 )
 def update_live_badge_and_button(_n, n_clicks):
-    from dash import ctx
+    from dash import ctx, no_update
 
-    # Bumps whenever live/cache data is applied so maps/KPIs re-read global df
+    # Only change data-version when weather data actually changes (avoids map redraw churn)
     version = (
         f"{_weather_source}|{_last_weather_update.isoformat()}"
         if _last_weather_update is not None
@@ -844,7 +852,8 @@ def update_live_badge_and_button(_n, n_clicks):
             color="info",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-        return badge, True, "↻ Updating…", version
+        # Don't bump data-version while still fetching — maps stay interactive
+        return badge, True, "↻ Updating…", no_update
 
     if _weather_ready:
         ts = (
