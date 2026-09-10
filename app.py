@@ -39,16 +39,17 @@ for feature in district_geojson["features"]:
         props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-# Fewer, slower batches reduce 429s on shared cloud IPs (e.g. Render free tier)
+# Conservative batching for shared cloud IPs (Render free tier)
 BATCH_SIZE = 40
-BATCH_PAUSE_SEC = 2.0  # pause between batches
+BATCH_PAUSE_SEC = 1.5
+# Hard cap so cold starts never sit on "Updating…" for many minutes
+FETCH_MAX_SECONDS = int(os.environ.get("FETCH_MAX_SECONDS", "90"))
 WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", "weather_cache.pkl")
-# Prefer disk cache over API when younger than this (hours)
 CACHE_MAX_AGE_HOURS = float(os.environ.get("CACHE_MAX_AGE_HOURS", "6"))
 
 
 def _save_weather_cache(dataframe):
-    """Persist weather columns so restarts / rate-limits can reuse last good data."""
+    """Persist weather columns (lost on Render free spin-down; helps while instance is warm)."""
     try:
         cols = [c for c in dataframe.columns if any(
             c.startswith(p) for p in (
@@ -57,22 +58,20 @@ def _save_weather_cache(dataframe):
                 "Stress Category_d", "Mortality_",
             )
         )]
-        cache_df = dataframe[["join_key"] + cols].copy()
-        cache_df.to_pickle(WEATHER_CACHE_FILE)
-        print(f"[weather] cache saved → {WEATHER_CACHE_FILE} ({len(cols)} cols)", flush=True)
+        dataframe[["join_key"] + cols].to_pickle(WEATHER_CACHE_FILE)
+        print(f"[weather] cache saved → {WEATHER_CACHE_FILE}", flush=True)
     except Exception as e:
         print(f"[weather] cache save failed: {e}", flush=True)
 
 
 def _load_weather_cache(dataframe, max_age_hours=None):
-    """Load cached weather into dataframe if file exists and is fresh enough."""
     if not os.path.exists(WEATHER_CACHE_FILE):
         return False
     try:
         age_h = (time.time() - os.path.getmtime(WEATHER_CACHE_FILE)) / 3600.0
         limit = CACHE_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
         if age_h > limit:
-            print(f"[weather] cache too old ({age_h:.1f}h > {limit}h), will try API", flush=True)
+            print(f"[weather] cache too old ({age_h:.1f}h > {limit}h)", flush=True)
             return False
         cache_df = pd.read_pickle(WEATHER_CACHE_FILE)
         if "join_key" not in cache_df.columns:
@@ -92,7 +91,10 @@ def _load_weather_cache(dataframe, max_age_hours=None):
 
 
 def fetch_batch(lats, lons):
-    """Fetch one batch of locations. Returns (list_of_dicts_or_None, hit_rate_limit)."""
+    """Fetch one batch. Returns (list, hit_rate_limit).
+
+    On 429: one short wait then give up — do NOT sleep for minutes (that stuck the UI).
+    """
     params = {
         "latitude": ",".join(f"{x:.4f}" for x in lats),
         "longitude": ",".join(f"{x:.4f}" for x in lons),
@@ -101,15 +103,16 @@ def fetch_batch(lats, lons):
         "wind_speed_unit": "ms",
         "timezone": "auto",
     }
-    # Longer backoff: shared cloud IPs often need minutes, not seconds
-    backoff_schedule = [30, 60, 120]
-    for attempt, wait in enumerate(backoff_schedule):
+    for attempt in range(2):
         try:
-            res = requests.get(OPEN_METEO_URL, params=params, timeout=60)
+            res = requests.get(OPEN_METEO_URL, params=params, timeout=45)
             if res.status_code == 429:
-                print(f"[weather] rate-limited (429), sleeping {wait}s (attempt {attempt + 1}/3)…", flush=True)
-                time.sleep(wait)
-                continue
+                if attempt == 0:
+                    print("[weather] rate-limited (429), brief pause 8s then retry once…", flush=True)
+                    time.sleep(8)
+                    continue
+                print("[weather] still rate-limited — skipping batch", flush=True)
+                return [None] * len(lats), True
             res.raise_for_status()
             data = res.json()
             if isinstance(data, dict) and "hourly" in data:
@@ -120,23 +123,31 @@ def fetch_batch(lats, lons):
                 return [data], False
             return [None] * len(lats), False
         except Exception as e:
-            print(f"[weather] batch attempt {attempt + 1}/3 failed: {e}", flush=True)
-            if attempt == len(backoff_schedule) - 1:
-                return [None] * len(lats), False
-            time.sleep(5)
-    # Exhausted retries still on 429
-    print("[weather] giving up on this batch after repeated 429s", flush=True)
+            print(f"[weather] batch error: {e}", flush=True)
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            return [None] * len(lats), False
     return [None] * len(lats), True
 
 
 def fetch_multi_day_weather(dataframe):
+    """Fetch all districts with a hard wall-clock limit (default 90s)."""
     lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
     all_responses = []
     n_batches = (len(dataframe) + BATCH_SIZE - 1) // BATCH_SIZE
     t0 = time.time()
     consecutive_rate_limits = 0
+    aborted = False
 
     for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
+        if time.time() - t0 > FETCH_MAX_SECONDS:
+            print(f"[weather] hit {FETCH_MAX_SECONDS}s time budget — stopping early", flush=True)
+            remaining = len(dataframe) - len(all_responses)
+            all_responses.extend([None] * remaining)
+            aborted = True
+            break
+
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
         print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…", flush=True)
@@ -145,11 +156,11 @@ def fetch_multi_day_weather(dataframe):
         if hit_limit:
             consecutive_rate_limits += 1
             all_responses.extend([None] * len(b_lats))
-            # Stop early if API keeps rejecting — avoid burning the shared quota
             if consecutive_rate_limits >= 2:
-                print("[weather] repeated rate-limits — aborting remaining batches", flush=True)
+                print("[weather] repeated 429s — aborting (use synthetic / try Update later)", flush=True)
                 remaining = len(dataframe) - len(all_responses)
                 all_responses.extend([None] * remaining)
+                aborted = True
                 break
         else:
             consecutive_rate_limits = 0
@@ -163,7 +174,7 @@ def fetch_multi_day_weather(dataframe):
 
         time.sleep(BATCH_PAUSE_SEC)
 
-    print(f"[weather] all batches done in {time.time() - t0:.1f}s", flush=True)
+    print(f"[weather] fetch finished in {time.time() - t0:.1f}s (aborted={aborted})", flush=True)
 
     peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
     for d_idx, h_idx in enumerate(peak_indices):
@@ -334,68 +345,62 @@ from datetime import datetime, timezone
 REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
 _weather_ready = False
 _weather_fetching = False
-_last_weather_update = None  # UTC timestamp of last successful live fetch
+_weather_source = "synthetic"  # synthetic | cache | live
+_last_weather_update = None
 _weather_lock = threading.Lock()
 _weather_thread_started = False
 _weather_thread_start_lock = threading.Lock()
 
 
 def _wlog(msg):
-    """Log to stdout with flush so Gunicorn/Render always shows the line."""
     print(msg, flush=True)
     sys.stdout.flush()
 
 
 def _run_one_weather_fetch():
-    """Fetch live data once and swap into the global df. Thread-safe.
+    """Fetch live data once. Never blocks the UI for more than ~FETCH_MAX_SECONDS.
 
-    Strategy on rate-limited cloud IPs:
-      1. Use fresh disk cache if available (skip API)
-      2. Otherwise call Open-Meteo with slow batches + long 429 backoff
-      3. On success, save cache; on failure, fall back to any cache (even older)
+    Render free tier spins down ~15 min idle and wipes disk cache, so every
+    cold start may hit Open-Meteo rate limits on a shared IP. We fail fast and
+    keep serving synthetic/cache data instead of staying on 'Updating…'.
     """
-    global df, _weather_ready, _last_weather_update, _weather_fetching
+    global df, _weather_ready, _last_weather_update, _weather_fetching, _weather_source
     if not _weather_lock.acquire(blocking=False):
         _wlog("[weather] fetch already in progress, skipping")
         return False
     _weather_fetching = True
     try:
-        # Prefer recent cache to avoid burning shared free-tier quota
         working = df.copy()
         if _load_weather_cache(working):
-            working = enrich_derived_columns(working)
-            df = working
+            df = enrich_derived_columns(working)
             _weather_ready = True
+            _weather_source = "cache"
             _last_weather_update = datetime.fromtimestamp(
                 os.path.getmtime(WEATHER_CACHE_FILE), tz=timezone.utc
             )
-            _wlog(f"[weather] using disk cache (updated {_last_weather_update.isoformat()})")
+            _wlog(f"[weather] using disk cache ({_last_weather_update.isoformat()})")
             return True
 
         _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
         updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
-
-        # If almost everything is still synthetic-looking missing after API, try any cache
-        sample_col = "UTCI_d0"
-        live_ratio = 1.0
-        if sample_col in updated.columns:
-            # crude: we always fill NaNs with synthetic, so always "full"
-            pass
-
         df = updated
         _save_weather_cache(df)
         _weather_ready = True
+        _weather_source = "live"
         _last_weather_update = datetime.now(timezone.utc)
-        _wlog(f"[weather] live data loaded successfully at {_last_weather_update.isoformat()}")
+        _wlog(f"[weather] live data loaded at {_last_weather_update.isoformat()}")
         return True
     except Exception as e:
         _wlog(f"[weather] fetch failed: {e}")
-        # Last resort: any cache regardless of age
         working = df.copy()
         if _load_weather_cache(working, max_age_hours=72):
             df = enrich_derived_columns(working)
+            _weather_source = "cache"
             _wlog("[weather] fell back to older disk cache")
+        else:
+            _weather_source = "synthetic"
+            _wlog("[weather] keeping synthetic data (API unavailable / rate-limited)")
         _weather_ready = True
         if _last_weather_update is None:
             _last_weather_update = datetime.now(timezone.utc)
@@ -670,9 +675,9 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # Timers: maps/KPIs every 5 min; badge/button state every 15 s (picks up manual refresh finish)
-    dcc.Interval(id="data-refresh-interval", interval=5 * 60 * 1000, n_intervals=0),
-    dcc.Interval(id="status-poll-interval", interval=15 * 1000, n_intervals=0),
+    # Poll often so UI picks up background weather updates; data-version bumps when df changes
+    dcc.Interval(id="status-poll-interval", interval=10 * 1000, n_intervals=0),
+    dcc.Store(id="data-version", data="init"),
 
     # --- HEADER & THEME TOGGLE ---
     dbc.Row([
@@ -814,6 +819,7 @@ def update_app_theme(dark_mode):
     Output('live-status-badge', 'children'),
     Output('btn-update-data', 'disabled'),
     Output('btn-update-data', 'children'),
+    Output('data-version', 'data'),
     Input('status-poll-interval', 'n_intervals'),
     Input('btn-update-data', 'n_clicks'),
     prevent_initial_call=False,
@@ -821,44 +827,55 @@ def update_app_theme(dark_mode):
 def update_live_badge_and_button(_n, n_clicks):
     from dash import ctx
 
-    # Manual click → kick off a background fetch (non-blocking)
+    # Bumps whenever live/cache data is applied so maps/KPIs re-read global df
+    version = (
+        f"{_weather_source}|{_last_weather_update.isoformat()}"
+        if _last_weather_update is not None
+        else f"{_weather_source}|init"
+    )
+
     clicked = ctx.triggered_id == "btn-update-data" and bool(n_clicks)
     if clicked:
         trigger_manual_weather_refresh()
 
-    # Show updating state right after click or while a fetch is running
     if clicked or _weather_fetching:
         badge = dbc.Badge(
-            "● Updating live weather…",
+            "● Updating…",
             color="info",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-        return badge, True, "↻ Updating…"
+        return badge, True, "↻ Updating…", version
 
-    if _weather_ready and _last_weather_update is not None:
-        ts = _last_weather_update.strftime("%H:%M UTC")
-        badge = dbc.Badge(
-            f"● Live · updated {ts} · refreshes every 3h",
-            color="success",
-            className="px-3 py-2 fs-6 rounded-pill shadow-sm",
+    if _weather_ready:
+        ts = (
+            _last_weather_update.strftime("%H:%M UTC")
+            if _last_weather_update is not None
+            else "—"
         )
-        return badge, False, "↻ Update data"
+        if _weather_source == "live":
+            text, color = f"● Live · {ts} · every 3h", "success"
+        elif _weather_source == "cache":
+            text, color = f"● Cached · {ts}", "success"
+        else:
+            text, color = "● Demo data · API busy — try Update later", "warning"
+        badge = dbc.Badge(text, color=color, className="px-3 py-2 fs-6 rounded-pill shadow-sm")
+        return badge, False, "↻ Update data", version
 
     badge = dbc.Badge(
-        "● Loading live weather…",
-        color="warning",
+        "● Starting…",
+        color="secondary",
         className="px-3 py-2 fs-6 rounded-pill shadow-sm",
     )
-    return badge, False, "↻ Update data"
+    return badge, False, "↻ Update data", version
 
 
 @callback(
     Output('kpi-summary-container', 'children'),
     Input('forecast-horizon', 'value'),
     Input('theme-switch', 'value'),
-    Input('data-refresh-interval', 'n_intervals'),
+    Input('data-version', 'data'),
 )
-def update_kpis(horizon, dark_mode, _n):
+def update_kpis(horizon, dark_mode, _version):
     utci_col = f"UTCI_d{horizon}"
     temp_col = f"Dry Bulb Temp_d{horizon}"
     
@@ -920,9 +937,9 @@ def update_slider_limits(measurement_chosen, horizon):
     Input('measurements', 'value'), Input('state-filter', 'value'),
     Input('color-range-slider', 'value'), Input('forecast-horizon', 'value'),
     Input('theme-switch', 'value'),
-    Input('data-refresh-interval', 'n_intervals'),
+    Input('data-version', 'data'),
 )
-def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode, _n):
+def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode, _version):
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
     r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
@@ -944,9 +961,9 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     Input('demographic-class', 'value'), Input('state-filter', 'value'),
     Input('forecast-horizon', 'value'), Input('mortality-range-slider', 'value'),
     Input('theme-switch', 'value'),
-    Input('data-refresh-interval', 'n_intervals'),
+    Input('data-version', 'data'),
 )
-def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _n):
+def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _version):
     target_col = f"Mortality_{demo_class}_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
 
@@ -1052,9 +1069,9 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     Output('stress-dist-chart', 'figure'),
     Input('state-filter', 'value'), Input('forecast-horizon', 'value'),
     Input('theme-switch', 'value'),
-    Input('data-refresh-interval', 'n_intervals'),
+    Input('data-version', 'data'),
 )
-def update_stress_chart(selected_state, horizon, dark_mode, _n):
+def update_stress_chart(selected_state, horizon, dark_mode, _version):
     target_col = f"Stress Category_d{horizon}"
     filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
     counts = filtered_df[target_col].value_counts().reset_index()
