@@ -708,7 +708,6 @@ app.layout = dbc.Container([
     # Fast status poll (badge only). Maps refresh only when data-version actually changes.
     dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
-    html.Div(id="update-click-sink", style={"display": "none"}),
 
     # --- HEADER & THEME TOGGLE ---
     dbc.Row([
@@ -725,10 +724,12 @@ app.layout = dbc.Container([
                 outline=True,
                 size="sm",
                 className="me-3 fw-bold",
+                n_clicks=0,
             ),
             dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block")
         ], md=5, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
     ], className="my-4 py-3 border-bottom"),
+    html.Div(id="update-feedback", className="small text-muted mb-2"),
 
     # --- FORECAST HORIZON SELECTOR & KPIS ---
     dbc.Card([
@@ -847,32 +848,35 @@ def update_app_theme(dark_mode):
 
 
 @callback(
-    Output("update-click-sink", "children"),
+    Output("live-status-badge", "children"),
+    Output("btn-update-data", "children"),
+    Output("data-version", "data"),
+    Output("update-feedback", "children"),
+    Input("status-poll-interval", "n_intervals"),
     Input("btn-update-data", "n_clicks"),
-    prevent_initial_call=True,
-)
-def on_update_data_click(n_clicks):
-    """Dedicated handler so every click is logged in Render."""
-    _wlog(f"[weather] BUTTON CALLBACK fired n_clicks={n_clicks}")
-    trigger_manual_weather_refresh()
-    return f"click-{n_clicks}"
-
-
-@callback(
-    Output('live-status-badge', 'children'),
-    Output('btn-update-data', 'children'),
-    Output('data-version', 'data'),
-    Input('status-poll-interval', 'n_intervals'),
-    State('data-version', 'data'),
+    State("data-version", "data"),
     prevent_initial_call=False,
 )
-def update_live_badge_and_button(_n, current_version):
+def update_live_badge_and_button(_n, n_clicks, current_version):
+    """Status poll + Update button in ONE callback so clicks cannot be dropped."""
+    from dash import ctx
+
     version = (
         f"{_weather_source}|{_last_weather_update.isoformat()}"
         if _last_weather_update is not None
         else f"{_weather_source}|init"
     )
     version_out = version if version != current_version else no_update
+    feedback = no_update
+
+    # Explicit click handling (must log every time)
+    if ctx.triggered_id == "btn-update-data" and n_clicks and n_clicks > 0:
+        _wlog(f"[weather] BUTTON CLICK received n_clicks={n_clicks} fetching={_weather_fetching}")
+        started = trigger_manual_weather_refresh()
+        if started:
+            feedback = f"Update requested at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC — fetch started (see logs)."
+        else:
+            feedback = f"Update clicked at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC — fetch already running or busy."
 
     if _weather_fetching:
         badge = dbc.Badge(
@@ -880,8 +884,7 @@ def update_live_badge_and_button(_n, current_version):
             color="info",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-        # Keep button enabled so further clicks still register & log
-        return badge, "↻ Updating…", version_out
+        return badge, "↻ Updating…", version_out, feedback
 
     if _weather_ready:
         ts = (
@@ -896,14 +899,14 @@ def update_live_badge_and_button(_n, current_version):
         else:
             text, color = "● Demo data · API rate-limited — try later", "warning"
         badge = dbc.Badge(text, color=color, className="px-3 py-2 fs-6 rounded-pill shadow-sm")
-        return badge, "↻ Update data", version_out
+        return badge, "↻ Update data", version_out, feedback
 
     badge = dbc.Badge(
         "● Starting…",
         color="secondary",
         className="px-3 py-2 fs-6 rounded-pill shadow-sm",
     )
-    return badge, "↻ Update data", version_out
+    return badge, "↻ Update data", version_out, feedback
 
 
 @callback(
