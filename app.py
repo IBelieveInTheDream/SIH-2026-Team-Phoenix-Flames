@@ -175,6 +175,11 @@ def fetch_multi_day_weather(dataframe):
         time.sleep(BATCH_PAUSE_SEC)
 
     print(f"[weather] fetch finished in {time.time() - t0:.1f}s (aborted={aborted})", flush=True)
+    # Stash abort flag for caller (live vs partial labeling)
+    dataframe.attrs["weather_aborted"] = aborted
+    n_ok = sum(1 for x in all_responses if x is not None)
+    dataframe.attrs["weather_ok_locations"] = n_ok
+    print(f"[weather] locations with API data: {n_ok}/{len(dataframe)}", flush=True)
 
     peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
     for d_idx, h_idx in enumerate(peak_indices):
@@ -389,11 +394,21 @@ def _run_one_weather_fetch(force=False):
         updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
         df = updated
+        aborted = bool(getattr(updated, "attrs", {}).get("weather_aborted", False))
+        n_ok = int(getattr(updated, "attrs", {}).get("weather_ok_locations", 0) or 0)
         _save_weather_cache(df)
         _weather_ready = True
-        _weather_source = "live"
         _last_weather_update = datetime.now(timezone.utc)
-        _wlog(f"[weather] live data loaded at {_last_weather_update.isoformat()}")
+        if aborted or n_ok < max(1, len(df) // 4):
+            # Mostly synthetic fill after 429 — do not claim full live data
+            _weather_source = "synthetic"
+            _wlog(
+                f"[weather] partial/failed live fetch "
+                f"(ok={n_ok}/{len(df)}, aborted={aborted}) — UI stays on demo/synthetic"
+            )
+        else:
+            _weather_source = "live"
+            _wlog(f"[weather] live data loaded at {_last_weather_update.isoformat()} (ok={n_ok})")
         return True
     except Exception as e:
         _wlog(f"[weather] fetch failed: {e}")
@@ -690,9 +705,10 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # Fast status poll (badge/button only). Maps refresh only when data-version actually changes.
+    # Fast status poll (badge only). Maps refresh only when data-version actually changes.
     dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
+    html.Div(id="update-click-sink", style={"display": "none"}),
 
     # --- HEADER & THEME TOGGLE ---
     dbc.Row([
@@ -831,37 +847,41 @@ def update_app_theme(dark_mode):
 
 
 @callback(
+    Output("update-click-sink", "children"),
+    Input("btn-update-data", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_update_data_click(n_clicks):
+    """Dedicated handler so every click is logged in Render."""
+    _wlog(f"[weather] BUTTON CALLBACK fired n_clicks={n_clicks}")
+    trigger_manual_weather_refresh()
+    return f"click-{n_clicks}"
+
+
+@callback(
     Output('live-status-badge', 'children'),
-    Output('btn-update-data', 'disabled'),
     Output('btn-update-data', 'children'),
     Output('data-version', 'data'),
     Input('status-poll-interval', 'n_intervals'),
-    Input('btn-update-data', 'n_clicks'),
     State('data-version', 'data'),
     prevent_initial_call=False,
 )
-def update_live_badge_and_button(_n, n_clicks, current_version):
-    from dash import ctx, no_update
-
+def update_live_badge_and_button(_n, current_version):
     version = (
         f"{_weather_source}|{_last_weather_update.isoformat()}"
         if _last_weather_update is not None
         else f"{_weather_source}|init"
     )
-    # Only push a new data-version when data actually changed → maps redraw at most then
     version_out = version if version != current_version else no_update
 
-    clicked = ctx.triggered_id == "btn-update-data" and bool(n_clicks)
-    if clicked:
-        trigger_manual_weather_refresh()
-
-    if _weather_fetching or (clicked and ctx.triggered_id == "btn-update-data"):
+    if _weather_fetching:
         badge = dbc.Badge(
             "● Updating…",
             color="info",
             className="px-3 py-2 fs-6 rounded-pill shadow-sm",
         )
-        return badge, True, "↻ Updating…", version_out
+        # Keep button enabled so further clicks still register & log
+        return badge, "↻ Updating…", version_out
 
     if _weather_ready:
         ts = (
@@ -874,16 +894,16 @@ def update_live_badge_and_button(_n, n_clicks, current_version):
         elif _weather_source == "cache":
             text, color = f"● Cached · {ts}", "success"
         else:
-            text, color = "● Demo data · API busy — try Update later", "warning"
+            text, color = "● Demo data · API rate-limited — try later", "warning"
         badge = dbc.Badge(text, color=color, className="px-3 py-2 fs-6 rounded-pill shadow-sm")
-        return badge, False, "↻ Update data", version_out
+        return badge, "↻ Update data", version_out
 
     badge = dbc.Badge(
         "● Starting…",
         color="secondary",
         className="px-3 py-2 fs-6 rounded-pill shadow-sm",
     )
-    return badge, False, "↻ Update data", version_out
+    return badge, "↻ Update data", version_out
 
 
 @callback(
